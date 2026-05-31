@@ -32,9 +32,10 @@ Register on spawn (`ros agent register --id <id> --role researcher`) and run a h
 
 ## On finish: WAKE THE ORCHESTRATOR (do not just stop)
 When you complete (or hit a blocker needing a decision), the orchestrator may be idle waiting on you. After
-your final `ros report ... --done`, PING it: use the agent_run.message Navi action to the orchestrator's
-session id with a one-line "EXP-<id> done, effect=<x>, CLAIM-<id> ready for next step — resume." A new_session
-researcher does NOT auto-announce to its spawner; you must ping. Silence leaves the orchestrator idle forever.
+your final `ros report ... --done`, PING THE ORCHESTRATOR (the hub) — agent_run.message to the ORCHESTRATOR
+SESSION ID that the orchestrator gave you at spawn (NOT the human, NOT the observer/monitor) with a one-line
+"EXP-<id> done, effect=<x>, CLAIM-<id> ready — resume." A new_session researcher does NOT auto-announce; you
+must ping the orchestrator. Results always flow back to the orchestrator; the observer only watches.
 
 ## Parallelism
 You are one of many. Use a unique --agent id (e.g. researcher-<topic>-<n>). Claim your topic in your first

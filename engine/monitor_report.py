@@ -124,12 +124,25 @@ for d in glob.glob(os.path.join(rd,"committee_run_*")):
         if not glob.glob(os.path.join(root,"registry","verdicts","VERDICT-*.yaml")):
             stuck.append(f"{run} committee DONE but no VERDICT written")
 
+# --- orchestrator self-report freshness (it should PUSH every ~10m) ---
+orch_report_age=None
+for fn in glob.glob(os.path.join(rd,"reports","*.jsonl")):
+    base=os.path.basename(fn)
+    if "orchestrator" in base:
+        last=None
+        for ln in open(fn,errors="ignore"):
+            try: last=json.loads(ln)
+            except: pass
+        if last: orch_report_age=age_min(last.get("ts",""))
+orch_silent = (orch_report_age is None) or (orch_report_age > W)
+
 # --- write report ---
 os.makedirs(os.path.join(rd,"monitor"),exist_ok=True)
 ts=NOW.strftime("%Y%m%d-%H%M%S")
 lines=[]
 def P(x): lines.append(x); print(x)
 P(f"# Monitor Report — {NOW.strftime('%H:%M UTC')} (window={W}m)")
+P(f"orchestrator self-report: {'SILENT >'+str(W)+'m (hub should push!)' if orch_silent else str(orch_report_age)+'m ago'}")
 P(f"orchestrator: {next((f'{r[4]} ({r[3]}m)' for r in roster if r[1]=='orchestrator'),'NOT FOUND')}")
 P(f"## Δ last {W}m: +{len(new_claims)} claims, +{len(done_exps)} experiments completed, +{len(new_verdicts)} verdicts")
 P(f"## Progress reports last {W}m: {reports_in_window} from {len(reporters)} researcher(s)")
@@ -158,7 +171,7 @@ else: P(f"## ✅ no dead agents")
 side={"ts":ts,"window_min":W,"delta":{"claims":len(new_claims),"experiments":len(done_exps),"verdicts":len(new_verdicts)},
       "researchers":[{"id":r[0],"role":r[1],"state":r[4],"age_min":r[3]} for r in researchers],
       "committee_runs":[{"run":n,"status":s,"votes":v} for n,s,v in comm_runs],
-      "reports_in_window":reports_in_window,"silent_researchers":[a for a,_,_ in silent_researchers],"inbox_pending":len(pending),"inbox_need_action":len(pending_action),"qa":[{"id":a_,"note":n} for a_,n in qa],"dead":[r[0] for r in dead],"stale":[r[0] for r in stale],"stuck":stuck}
+      "reports_in_window":reports_in_window,"silent_researchers":[a for a,_,_ in silent_researchers],"inbox_pending":len(pending),"inbox_need_action":len(pending_action),"qa":[{"id":a_,"note":n} for a_,n in qa],"dead":[r[0] for r in dead],"stale":[r[0] for r in stale],"stuck":stuck,"orchestrator_self_report_age_min":orch_report_age,"orchestrator_silent":orch_silent}
 open(os.path.join(rd,"monitor",f"report-{ts}.md"),"w").write("\n".join(lines))
 open(os.path.join(rd,"monitor",f"report-{ts}.json"),"w").write(json.dumps(side,indent=2))
 print(f"\n(report saved: runtime/monitor/report-{ts}.md)")
