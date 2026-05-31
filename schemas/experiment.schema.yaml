@@ -1,0 +1,22 @@
+# Schema: an EXPERIMENT record. registry/experiments/EXP-xxxx.yaml + experiments/EXP-xxxx/ artifact dir.
+# INVARIANT: nothing consuming compute runs without one of these registered FIRST.
+exp_id: EXP-0000
+project_id: PROJ-0000
+claim_id: CLAIM-0000            # what claim this tests (may be null only for pure infra probes)
+session_id: ""                 # raw execution log location
+level: 0                       # 0 cheap-kill | 1 bounded | 2 claim-defining | 3 dangerous/large
+hardware: ""                   # node + GPU type (from config, e.g. <GPU-NODE-A>/H100)
+resource_budget:
+  max_wall_clock_minutes: 0
+  max_gpu_hours: 0
+  max_memory_gb: 0
+  host_mem_floor_gb: 0         # WATCHDOG: abort if host RAM below this (crash-prevention)
+status: pending                # pending | running | completed | failed | killed
+result_summary: ""
+result_effect: ""              # killed | weakened | supported | promoted | inconclusive
+artifacts_path: ""             # experiments/EXP-xxxx/
+reproducibility: ""            # repro command / status
+linked_verdicts: []
+started_at: ""
+completed_at: ""
+prompt_version: ""

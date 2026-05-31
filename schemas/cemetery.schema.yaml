@@ -1,0 +1,12 @@
+# Schema: a DEAD idea. registry/cemetery/DEAD-xxxx.yaml
+# INVARIANT: new seeds are checked against these; exact/near duplicates are refused.
+dead_id: DEAD-0000
+original_claim_id: CLAIM-0000
+original_claim: ""
+reason_killed: ""              # one-line cause (e.g. "baseline X dominates", "novelty collision")
+killing_verdict: ""            # VERDICT-id
+killing_experiments: []        # [EXP-ids]
+duplicate_patterns: []         # normalized keywords/fingerprints used by the dup-check
+revival_conditions: ""         # the ONLY way this comes back
+related_prior_work: []
+date_killed: ""

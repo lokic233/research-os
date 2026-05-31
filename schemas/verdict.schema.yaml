@@ -1,0 +1,13 @@
+# Schema: a committee VERDICT. registry/verdicts/VERDICT-xxxx.yaml
+verdict_id: VERDICT-0000
+claim_id: CLAIM-0000
+project_id: PROJ-0000
+committee_version: ""          # committee config/rubric version
+prompt_versions: {}            # {role: version} for each reviewer
+reviewer_votes: []             # [{role, vote, rationale, cited_evidence}]
+final_verdict: ""              # green | yellow | red | kill | promote | needs-more-evidence
+fatal_objections: []
+required_evidence: []          # what would move it forward
+map_delta_proposals: []        # proposed academic-map edits (committee proposes, orchestrator merges)
+baseline_requirements: []
+created_at: ""

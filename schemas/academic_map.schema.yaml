@@ -1,0 +1,14 @@
+# Schema: the ACADEMIC MAP. registry/academic_map.yaml (single file, nodes list).
+# Links territory <-> claims <-> dead ideas <-> baselines <-> gaps.
+nodes:
+  - node_id: MAP-0000
+    area: ""                   # research area
+    occupied_territory: ""     # what's already done here (with prior work)
+    key_prior_work: []         # [{cite, url, core_idea}]
+    known_baselines: []        # baseline ids relevant here
+    open_gaps: []              # underexplored directions
+    red_zones: []              # known-dead / dominated directions
+    associated_claims: []      # CLAIM-ids
+    associated_dead_ideas: []  # DEAD-ids
+    status: ""                 # green | yellow | red (direction health)
+    last_updated: ""

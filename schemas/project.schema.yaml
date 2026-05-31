@@ -1,0 +1,10 @@
+# Schema: a PROJECT lifecycle record. registry/projects.yaml (or projects/<id>.yaml)
+project_id: PROJ-0000
+title: ""
+stage: exploration            # seed | exploration | candidate | paper-track | archived
+claims: []                    # CLAIM-ids under this project
+target_venue: ""              # if candidate/paper-track
+budget_spent_gpu_hours: 0
+entry_criteria_met: []        # which promotion gates passed
+created_at: ""
+last_updated: ""

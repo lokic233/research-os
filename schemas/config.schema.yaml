@@ -1,0 +1,33 @@
+# Schema: research-os.config.yaml — lives in the INSTANCE repo. The platform-agnostic knobs.
+# This is what makes the engine reusable: nodes/backends/budgets are config, never hardcoded.
+engine:
+  repo: lokic233/research-os
+  version: v0
+instance:
+  name: ""                     # e.g. "lokic233" -> lokic233/autonomous-research
+  repo: ""
+runtime:
+  control_node: ""             # stable node hosting runtime/ (e.g. a laptop) — NOT a GPU node
+  runtime_dir: ""              # abs path to runtime/ on the control node
+compute_nodes: []              # [{name, kind, gpu_type, host_mem_gb, notes, fragile: true/false}]
+committee:                     # logical-standing, physically-on-demand
+  rubric_version: v001
+  members:                     # role -> backend (backend is config!)
+    - {role: novelty_killer,        backend: ""}
+    - {role: systems_reviewer,      backend: ""}
+    - {role: evaluation_prosecutor, backend: ""}
+    - {role: theory_skeptic,        backend: ""}
+    - {role: product_realist,       backend: ""}
+    - {role: area_chair,            backend: ""}
+  green_rule: unanimous        # what counts as GREEN
+liveness:
+  mode: push                   # agents kick the supervisor; supervisor does not poll-kill
+  kick_interval_minutes: 15    # each agent reports alive every ~15m
+  patient_grace_minutes: 45    # do NOT declare dead before this (reasoning/long-runs are normal)
+budgets:
+  level0: {max_wall_clock_minutes: 15, max_gpu_hours: 0.25}
+  level1: {max_wall_clock_minutes: 120, max_gpu_hours: 2}
+  level2: {requires_orchestrator_approval: true}
+  level3: {requires_explicit_human_approval: true}
+safety:
+  vmm_probe_rule: "cap small; watchdog host RAM AND teardown; use os._exit(); read learning/ first"

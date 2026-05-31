@@ -1,0 +1,9 @@
+# Schema: the BASELINE MATRIX. registry/baselines.yaml
+families:
+  - claim_family: ""           # e.g. "GPU KV-cache CoW"
+    mandatory_baselines: []    # [{name, why, repo_or_cite}]
+    comparison_metrics: []     # [latency, peak_hbm, throughput, ...]
+    kill_conditions: []        # "if baseline beats us on X by Y -> claim dies"
+    min_acceptable_evidence: ""
+    known_dominant_baselines: []
+    tested_by: []              # EXP-ids that tested these

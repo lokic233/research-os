@@ -1,0 +1,6 @@
+# runtime/ lives on the control node, never committed to the ENGINE repo
+runtime/
+__pycache__/
+*.pyc
+/tmp/
+.DS_Store

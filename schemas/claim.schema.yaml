@@ -1,0 +1,19 @@
+# Schema: a research CLAIM (first-class durable object). One file per claim: registry/claims/CLAIM-xxxx.yaml
+# Append-only spirit: status/verdict_history grow; never delete, archive instead.
+claim_id: CLAIM-0000              # globally unique, zero-padded
+project_id: PROJ-0000            # owning project (lifecycle state)
+stage: seed                      # seed | exploration | candidate | paper-track | archived
+status: active                  # seed | active | weakened | killed | promoted | archived
+claim: ""                       # one-sentence falsifiable claim
+why_it_matters: ""              # the pain point / impact
+novelty_hypothesis: ""          # what is claimed new (mechanism, not naming)
+mandatory_baselines: []         # baselines this MUST beat/compare (from baseline matrix)
+academic_map_nodes: []          # which map node(s) this occupies
+supporting_evidence: []         # [{exp_id, summary, data_path}]
+negative_evidence: []           # [{exp_id, summary, data_path}]  <- kept, never hidden
+verdict_history: []             # [{verdict_id, date, result}]
+revival_conditions: ""          # if killed/archived: exactly what evidence would revive it
+owner: ""                       # session/agent/human that owns it
+prompt_version: ""              # role-prompt version that created/last-edited
+created_at: ""
+last_updated: ""
