@@ -58,9 +58,9 @@ $(cat "$PACKET")
 Output ONLY your structured vote block for role $role."
   case "$backend" in
     claude-*|opus*|sonnet*) claude ${CLAUDE_SANDBOX_FLAG:---dangerously-disable-osx-sandbox} --model "$backend" -p "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
-    codex*)                 codex exec --skip-git-repo-check "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
-    gemini*)                gemini -p "$full" >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
-    metacode*|avocado*|muse*) metacode run --yolo "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
+    codex*)                 codex --dangerously-disable-osx-sandbox exec --skip-git-repo-check "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
+    gemini*)                gemini --dangerously-disable-osx-sandbox -p "$full" >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
+    metacode*|avocado*|muse*) metacode --dangerously-disable-osx-sandbox run --yolo "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
     *)                      echo "ERROR: unknown backend '$backend' for role $role (no CLI shape match)" >"$OUT/${role}.err"; : >"$OUT/${role}.out" ;;
   esac
   # BUG-12: flag empty/failed output so a parser never miscounts a no-op as a vote
