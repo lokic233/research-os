@@ -534,6 +534,31 @@ def cmd_projects(args):
         print(f"  {pid}: {title}  (latest progress: {last})")
 
 
+def cmd_exp_gc(args):
+    """BUG-23: retire orphan pending experiments (registered but never completed) + clear their dangling
+    active_experiments back-links on claims. Reports what it would do; --apply to act."""
+    root=inst_root(args)
+    orphans=[]
+    for ef in glob.glob(os.path.join(root,"experiments","**","experiment.yaml"),recursive=True):
+        e=load_yaml(ef,{}) or {}
+        if e.get("status")=="pending" and not e.get("result_effect"):
+            orphans.append((e.get("exp_id"),e.get("claim_id"),os.path.dirname(ef)))
+    if not orphans: print("✅ no orphan pending experiments"); return
+    print(f"{'RETIRING' if args.apply else 'WOULD RETIRE'} {len(orphans)} orphan pending experiment(s):")
+    for eid,cid,d in orphans:
+        print(f"  {eid} (claim {cid})")
+        if args.apply:
+            # clear from claim.active_experiments
+            if cid:
+                cf=find_obj(root,"claims",cid); c=load_yaml(cf) if cf else None
+                if c and eid in (c.get("active_experiments") or []):
+                    c["active_experiments"].remove(eid); c["last_updated"]=NOW(); dump_yaml(cf,c)
+            # mark the experiment retired (keep the dir for audit; don't delete)
+            ef=os.path.join(d,"experiment.yaml"); e=load_yaml(ef); e["status"]="retired"
+            e["result_summary"]="retired by ros exp gc (orphan pending, never completed)"; dump_yaml(ef,e)
+    if not args.apply: print("   (dry-run; re-run with --apply to retire)")
+    else: print("   retired + cleared back-links")
+
 def cmd_verdict_write(args):
     """Write a committee VERDICT into verdicts/<PROJ>/<date>/, REQUIRING linked experiment ids that exist.
     Enforces config green_rule (BUG-3 fix): green/promote require full committee parity.
@@ -722,6 +747,8 @@ def main():
     ec.add_argument("--exp", required=True); ec.add_argument("--effect", required=True)
     ec.add_argument("--summary", required=True); ec.add_argument("--revival")
     ec.set_defaults(fn=cmd_exp_complete)
+    eg = esub.add_parser("gc"); eg.add_argument("--apply", action="store_true", help="actually retire (default dry-run)")
+    eg.set_defaults(fn=cmd_exp_gc)
     ed = esub.add_parser("dispatch")
     ed.add_argument("--exp", required=True); ed.add_argument("--node", required=True)
     ed.add_argument("--by", help="orchestrator id"); ed.add_argument("--approve", action="store_true")
