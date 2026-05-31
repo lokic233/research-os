@@ -416,11 +416,10 @@ def cmd_exp_dispatch(args):
         sys.exit(f"❌ SAFETY: node '{args.node}' is fragile and exp {args.exp} has no host_mem_floor_gb. "
                  f"Re-register with --host-mem-floor (watchdog) before dispatch. (See learning/ postmortems.)")
     lvl = exp.get("level", 0)
-    bcfg = (cfg.get("budgets") or {}).get(f"level{lvl}", {})
-    if bcfg.get("requires_orchestrator_approval") and not args.approve:
-        sys.exit(f"❌ level {lvl} requires orchestrator approval: re-run with --approve.")
-    if bcfg.get("requires_explicit_human_approval") and not args.human_approved:
-        sys.exit(f"❌ level {lvl} (dangerous) requires explicit human approval: re-run with --human-approved.")
+    # FULLY AUTONOMOUS (no human gate). A GPU exp must be COMMITTEE-APPROVED to be dispatchable.
+    if not (exp.get("committee_approved") or args.force):
+        sys.exit(f"❌ {args.exp} not committee_approved — enqueue via `ros gpu queue` only after a committee "
+                 f"verdict approves the experiment (or --force for an explicit override).")
     exp["status"] = "running"; exp["started_at"] = NOW()
     exp["dispatched_by"] = args.by or "orchestrator"
     exp["node_lease"] = f"{args.node}:{exp.get('exp_id')}"
@@ -570,6 +569,75 @@ def cmd_exp_gc(args):
     if not args.apply: print("   (dry-run; re-run with --apply to retire)")
     else: print("   retired + cleared back-links")
 
+def _gpu_queue_path(root):
+    return os.path.join(runtime_dir(root), "gpu_queue.yaml")
+
+def cmd_gpu_queue(args):
+    """Enqueue a COMMITTEE-APPROVED GPU experiment. Pull-based scheduler dispatches it when a node is free."""
+    root=inst_root(args)
+    hits=glob.glob(os.path.join(root,"experiments","**",args.exp,"experiment.yaml"),recursive=True)
+    ef=hits[0] if hits else None; exp=load_yaml(ef) if ef else None
+    if not exp: sys.exit(f"❌ {args.exp} not found.")
+    if not (exp.get("committee_approved") or args.force):
+        sys.exit(f"❌ {args.exp} is not committee_approved — only committee-greenlit experiments enter the GPU queue (--force to override).")
+    floor=(exp.get("resource_budget") or {}).get("host_mem_floor_gb",0) or 0
+    q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
+    if any(i.get("exp_id")==args.exp for i in q["queue"]): print(f"already queued: {args.exp}"); return
+    q["queue"].append({"exp_id":args.exp,"claim_id":exp.get("claim_id"),"gpu_type":args.gpu_type or "any",
+                       "host_mem_floor_gb":floor,"queued_at":NOW(),"priority":args.priority or 0})
+    dump_yaml(_gpu_queue_path(root),q)
+    print(f"✅ queued {args.exp} (gpu={args.gpu_type or 'any'}, floor={floor}GB). Scheduler pulls it when a node frees.")
+
+def cmd_gpu_status(args):
+    root=inst_root(args); q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
+    cfg=_cfg(root); nodes=cfg.get("compute_nodes",[]) or []
+    print("GPU NODES (standby):")
+    for n in nodes:
+        lease=q.get("leases",{}).get(n["name"])
+        print(f"  {n['name']} ({n.get('gpu_type','?')}, fragile={bool(n.get('fragile'))}): "
+              + (f"BUSY -> {lease}" if lease else "FREE"))
+    print(f"QUEUE ({len(q.get('queue',[]))} pending):")
+    for i in sorted(q.get("queue",[]),key=lambda x:-x.get("priority",0)):
+        print(f"  {i['exp_id']} (claim {i.get('claim_id')}, gpu={i.get('gpu_type')}, floor={i.get('host_mem_floor_gb')}GB)")
+
+def cmd_gpu_poll(args):
+    """PULL-BASED scheduler tick for a STANDBY node. Probes the node; if FREE and lease-free, pulls the next
+    queued exp (matching gpu_type, watchdog-safe) and dispatches it. Run this on a cadence per node."""
+    import subprocess
+    root=inst_root(args); cfg=_cfg(root)
+    node=next((n for n in (cfg.get("compute_nodes") or []) if n.get("name")==args.node),None)
+    if not node: sys.exit(f"❌ node {args.node} not in config")
+    q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
+    q.setdefault("leases",{})
+    # already leased? report and exit (don't double-dispatch)
+    if q["leases"].get(args.node):
+        print(f"{args.node} BUSY (lease {q['leases'][args.node]}); no pull."); return
+    # probe node free (config probe_cmd must succeed)
+    if node.get("probe_cmd"):
+        r=subprocess.run(node["probe_cmd"],shell=True,capture_output=True,text=True,timeout=30)
+        if r.returncode!=0: print(f"{args.node} unreachable (probe failed); no pull."); return
+    # pick next queued exp matching this node's gpu_type (or 'any'), highest priority, watchdog-safe on fragile
+    cand=None
+    for i in sorted(q["queue"],key=lambda x:-x.get("priority",0)):
+        gt=i.get("gpu_type","any")
+        if gt not in ("any", node.get("gpu_type")): continue
+        if node.get("fragile") and (i.get("host_mem_floor_gb",0) or 0)<=0: continue  # SAFETY: never on fragile w/o floor
+        cand=i; break
+    if not cand: print(f"{args.node} FREE but no matching queued exp."); return
+    # claim the lease + mark dispatched
+    q["queue"]=[i for i in q["queue"] if i["exp_id"]!=cand["exp_id"]]
+    q["leases"][args.node]=cand["exp_id"]; dump_yaml(_gpu_queue_path(root),q)
+    ef=glob.glob(os.path.join(root,"experiments","**",cand["exp_id"],"experiment.yaml"),recursive=True)[0]
+    e=load_yaml(ef); e["status"]="running"; e["started_at"]=NOW(); e["dispatched_by"]="gpu-scheduler"
+    e["node_lease"]=f"{args.node}:{cand['exp_id']}"; e["hardware"]=node.get("gpu_type",""); dump_yaml(ef,e)
+    print(f"🚀 PULLED {cand['exp_id']} -> {args.node} ({node.get('gpu_type')}, fragile={bool(node.get('fragile'))}, floor={cand.get('host_mem_floor_gb')}GB)")
+    print(f"   run it with host-RAM watchdog on alloc AND teardown (os._exit). On completion: `ros gpu release --node {args.node}` then ros exp complete.")
+
+def cmd_gpu_release(args):
+    root=inst_root(args); q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
+    rel=q.get("leases",{}).pop(args.node,None); dump_yaml(_gpu_queue_path(root),q)
+    print(f"released {args.node}" + (f" (was {rel})" if rel else " (no lease)"))
+
 def cmd_verdict_write(args):
     """Write a committee VERDICT into verdicts/<PROJ>/<date>/, REQUIRING linked experiment ids that exist.
     Enforces config green_rule (BUG-3 fix): green/promote require full committee parity.
@@ -635,6 +703,12 @@ def cmd_verdict_write(args):
     for eid in exp_ids:
         ep=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)[0]
         e=load_yaml(ep); e.setdefault("linked_verdicts",[]).append(vid); dump_yaml(ep,e)
+    # committee can greenlight a FOLLOW-UP GPU experiment id(s) to enter the queue (autonomous, no human gate)
+    for aeid in [x.strip() for x in (args.approves_exp or "").split(",") if x.strip()]:
+        ah=glob.glob(os.path.join(root,"experiments","**",aeid,"experiment.yaml"),recursive=True)
+        if ah:
+            ae=load_yaml(ah[0]); ae["committee_approved"]=vid; dump_yaml(ah[0],ae)
+            print(f"   committee-approved {aeid} for GPU queue (via {vid})")
     print(f"✅ {vid} ({args.final}) -> {os.path.relpath(path,root)}")
     print(f"   votes: {len(parsed)}/{len(members) or 6}  cites: {', '.join(exp_ids)}  | claim {args.claim} updated")
 
@@ -690,6 +764,12 @@ def main():
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("projects").set_defaults(fn=cmd_projects)
     sub.add_parser("resume").set_defaults(fn=cmd_resume)
+    gp=sub.add_parser("gpu"); gps=gp.add_subparsers(dest="sub",required=True)
+    gq=gps.add_parser("queue"); gq.add_argument("--exp",required=True); gq.add_argument("--gpu-type",dest="gpu_type")
+    gq.add_argument("--priority",type=int); gq.add_argument("--force",action="store_true"); gq.set_defaults(fn=cmd_gpu_queue)
+    gps.add_parser("status").set_defaults(fn=cmd_gpu_status)
+    gpp=gps.add_parser("poll"); gpp.add_argument("--node",required=True); gpp.set_defaults(fn=cmd_gpu_poll)
+    gpr=gps.add_parser("release"); gpr.add_argument("--node",required=True); gpr.set_defaults(fn=cmd_gpu_release)
     ca=sub.add_parser("claim"); cas=ca.add_subparsers(dest="sub",required=True)
     cav=cas.add_parser("advance")
     cav.add_argument("--claim",required=True); cav.add_argument("--state",required=True,help="lifecycle_state")
@@ -707,6 +787,7 @@ def main():
     vwr.add_argument("--map-delta",dest="map_delta",help="academic-map delta proposals, ';'-separated")
     vwr.add_argument("--baselines",help="baseline_requirements, ';'-separated")
     vwr.add_argument("--allow-dup",dest="allow_dup",action="store_true",help="bypass idempotency dedup (force a duplicate verdict)")
+    vwr.add_argument("--approves-exp",dest="approves_exp",help="EXP-id(s) the committee greenlights for the GPU queue (autonomous dispatch)")
     vwr.set_defaults(fn=cmd_verdict_write)
     # env discovery
     ev = sub.add_parser("env"); evs = ev.add_subparsers(dest="sub", required=True)
@@ -764,7 +845,7 @@ def main():
     ed = esub.add_parser("dispatch")
     ed.add_argument("--exp", required=True); ed.add_argument("--node", required=True)
     ed.add_argument("--by", help="orchestrator id"); ed.add_argument("--approve", action="store_true")
-    ed.add_argument("--human-approved", dest="human_approved", action="store_true")
+    ed.add_argument("--force", action="store_true", help="override committee-approval requirement (explicit)")
     ed.set_defaults(fn=cmd_exp_dispatch)
     args = ap.parse_args(); args.fn(args)
 
