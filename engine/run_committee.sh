@@ -59,7 +59,7 @@ Output ONLY your structured vote block for role $role."
   case "$backend" in
     claude-*|opus*|sonnet*) claude ${CLAUDE_SANDBOX_FLAG:---dangerously-disable-osx-sandbox} --model "$backend" -p "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
     codex*)                 codex --dangerously-disable-osx-sandbox exec --skip-git-repo-check "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
-    gemini*)                gemini --dangerously-disable-osx-sandbox -p "$full" >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
+    gemini*)                gemini --dangerously-disable-osx-sandbox -p "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
     metacode*|avocado*|muse*) metacode --dangerously-disable-osx-sandbox run --yolo "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
     *)                      echo "ERROR: unknown backend '$backend' for role $role (no CLI shape match)" >"$OUT/${role}.err"; : >"$OUT/${role}.out" ;;
   esac
@@ -70,7 +70,7 @@ Output ONLY your structured vote block for role $role."
     case "$backend" in
       claude-*|opus*|sonnet*) claude ${CLAUDE_SANDBOX_FLAG:---dangerously-disable-osx-sandbox} --model "$backend" -p "$full" </dev/null >"$OUT/${role}.out" 2>>"$OUT/${role}.err" ;;
       codex*)                 codex --dangerously-disable-osx-sandbox exec --skip-git-repo-check "$full" </dev/null >"$OUT/${role}.out" 2>>"$OUT/${role}.err" ;;
-      gemini*)                gemini --dangerously-disable-osx-sandbox -p "$full" >"$OUT/${role}.out" 2>>"$OUT/${role}.err" ;;
+      gemini*)                gemini --dangerously-disable-osx-sandbox -p "$full" </dev/null >"$OUT/${role}.out" 2>>"$OUT/${role}.err" ;;
       metacode*|avocado*|muse*) metacode --dangerously-disable-osx-sandbox run --yolo "$full" </dev/null >"$OUT/${role}.out" 2>>"$OUT/${role}.err" ;;
     esac
   fi
@@ -82,20 +82,22 @@ Output ONLY your structured vote block for role $role."
 # BUG-20b: stagger ~3s so concurrent claude procs don't overwhelm the gateway.
 # BUG-21: pre-create .err for every member up front + VERIFY all produced .out before signalling DONE,
 #         so a dropped/never-invoked member is ALWAYS caught (never a false ALL_COMMITTEE_DONE).
+# BUG-22: read the launch loop on FD 9 (NOT stdin) so a backgrounded CLI child cannot drain the member
+#         list and truncate the loop. ALL_ROLES is the FULL configured set, computed independently so the
+#         completion gate is never fooled by a short-read loop.
 CHAIR_ROLE="" CHAIR_BACKEND=""
-ALL_ROLES=""
-while read -r role backend; do
+ALL_ROLES="$(awk '{print $1}' "$MEMBERS_FILE")"
+for role in $ALL_ROLES; do : > "$OUT/${role}.err"; done   # pre-create every .err (BUG-21)
+while read -r role backend <&9; do
   [ -z "$role" ] && continue
-  ALL_ROLES="$ALL_ROLES $role"
-  : > "$OUT/${role}.err"   # BUG-21: ensure an .err exists even if run_one never executes
   if [ "$role" = "area_chair" ]; then CHAIR_ROLE="$role"; CHAIR_BACKEND="$backend"; continue; fi
-  run_one "$role" "$backend" &
+  run_one "$role" "$backend" </dev/null &
   sleep 3
-done < "$MEMBERS_FILE"
+done 9< "$MEMBERS_FILE"
 wait   # all reviewer jobs done + .out flushed
 if [ -n "$CHAIR_ROLE" ]; then
   echo "  (reviewers done; running $CHAIR_ROLE to aggregate)"
-  run_one "$CHAIR_ROLE" "$CHAIR_BACKEND"
+  run_one "$CHAIR_ROLE" "$CHAIR_BACKEND" </dev/null
 fi
 # BUG-21: completion is gated on EVERY member having a non-empty .out (else INCOMPLETE + list missing)
 MISSING=""
