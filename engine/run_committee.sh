@@ -57,7 +57,7 @@ $(cat "$PACKET")
 === END PACKET ===$reviewer_block
 Output ONLY your structured vote block for role $role."
   case "$backend" in
-    claude-*|opus*|sonnet*) claude --model "$backend" -p "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
+    claude-*|opus*|sonnet*) claude ${CLAUDE_SANDBOX_FLAG:---dangerously-disable-osx-sandbox} --model "$backend" -p "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
     codex*)                 codex exec --skip-git-repo-check "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
     gemini*)                gemini -p "$full" >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
     metacode*|avocado*|muse*) metacode run --yolo "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
