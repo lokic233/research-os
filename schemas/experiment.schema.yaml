@@ -5,7 +5,7 @@ project_id: PROJ-0000
 claim_id: CLAIM-0000            # what claim this tests (may be null only for pure infra probes)
 session_id: ""                 # raw execution log location
 level: 0                       # 0 cheap-kill | 1 bounded | 2 claim-defining | 3 dangerous/large
-hardware: ""                   # node + GPU type (from config, e.g. <GPU-NODE-A>/H100)
+hardware: ""                   # node + accelerator type, from config (e.g. <COMPUTE-NODE>/<ACCEL>)
 resource_budget:
   max_wall_clock_minutes: 0
   max_gpu_hours: 0

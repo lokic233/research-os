@@ -4,8 +4,9 @@ MUST cite sources actually searched here. A "kill" citation counts only if verif
 
 ## How to actually search (commands available on nodes)
 - **Web**: `web_search` tool (titles/URLs/excerpts) — fast first pass for papers, repos, docs, blogs.
-- **Meta CLI** (`meta`, on a devvm/control node, after `source /tmp/agentenv.sh`): resolve fburl/docs,
-  fetch Google Docs/Sheets, look up internal tasks/diffs. Use for internal context, NOT public novelty.
+- **Org/internal CLI** (if your environment provides one; see the instance's private config/bootstrap):
+  resolve internal short-links/docs, fetch internal task/diff context. Use for internal context, NOT public novelty.
+  (Engine stays platform-agnostic; any internal-tool wiring lives in your private instance bootstrap, never here.)
 - **GitHub**: `gh search repos/code/prs/issues "<query>"`, `gh repo view`, clone + grep for mechanism checks.
 - **arXiv / Semantic Scholar / OpenAlex / DBLP**: via `web_search` or direct HTTP (curl) to their public APIs.
 - **Papers with Code**: leaderboards + linked repos for baseline-state.
