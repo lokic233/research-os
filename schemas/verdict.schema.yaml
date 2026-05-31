@@ -2,6 +2,12 @@
 verdict_id: VERDICT-0000
 claim_id: CLAIM-0000
 project_id: PROJ-0000
+date: ""                          # YYYY-MM-DD; verdict filed under verdicts/<PROJ>/<date>/
+experiment_ids: []               # REQUIRED: the EXP-xxx (experiments/<date>/EXP-xxx) that informed this verdict
+experiment_paths: []             # resolved artifact paths for traceability
+date: ""                          # YYYY-MM-DD; verdict filed under verdicts/<PROJ>/<date>/
+experiment_ids: []               # REQUIRED: the EXP-xxx (experiments/<date>/EXP-xxx) that informed this verdict
+experiment_paths: []             # resolved artifact paths for traceability
 committee_version: ""          # committee config/rubric version
 prompt_versions: {}            # {role: version} for each reviewer
 reviewer_votes: []             # [{role, vote, rationale, cited_evidence}]

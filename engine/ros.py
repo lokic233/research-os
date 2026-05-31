@@ -570,6 +570,80 @@ def cmd_projects(args):
         print(f"  {pid}: {title}  (latest progress: {last})")
 
 
+def cmd_verdict_write(args):
+    """Write a committee VERDICT into verdicts/<PROJ>/<date>/, REQUIRING linked experiment ids that exist.
+    Back-links the verdict into the claim's verdict_history + each experiment's linked_verdicts."""
+    root=inst_root(args)
+    cf=find_obj(root,"claims",args.claim)
+    if not cf: sys.exit(f"❌ claim {args.claim} not found.")
+    claim=load_yaml(cf); pid=claim.get("project_id","PROJ-0000")
+    # validate experiment links (must exist under experiments/**/<EXP>/)
+    exp_ids=[e.strip() for e in (args.experiments or "").split(",") if e.strip()]
+    if not exp_ids:
+        sys.exit("❌ a verdict MUST cite the experiment(s) that informed it: --experiments EXP-xxxx[,EXP-yyyy]")
+    exp_paths=[]
+    for eid in exp_ids:
+        hits=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)
+        if not hits: sys.exit(f"❌ experiment {eid} not found under experiments/ — cannot file a verdict citing it.")
+        exp_paths.append(os.path.relpath(os.path.dirname(hits[0]),root))
+    vid=next_id(root,"verdicts","VERDICT")
+    import datetime as _d
+    date=args.date or _d.datetime.now(_d.timezone.utc).strftime("%Y-%m-%d")
+    votes=[v.strip() for v in (args.votes or "").split(",") if v.strip()]  # role:vote pairs
+    obj={"verdict_id":vid,"claim_id":args.claim,"project_id":pid,"date":date,
+         "experiment_ids":exp_ids,"experiment_paths":exp_paths,
+         "committee_version":args.committee_version or "v001","prompt_versions":{},
+         "reviewer_votes":[dict(zip(["role","vote"],v.split(":",1))) for v in votes],
+         "final_verdict":args.final,"fatal_objections":[],"required_evidence":[],
+         "map_delta_proposals":[],"baseline_requirements":[],"created_at":NOW()}
+    d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
+    # back-link claim + experiments
+    claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final})
+    claim["last_updated"]=NOW(); dump_yaml(cf,claim)
+    for eid in exp_ids:
+        ep=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)[0]
+        e=load_yaml(ep); e.setdefault("linked_verdicts",[]).append(vid); dump_yaml(ep,e)
+    print(f"✅ {vid} ({args.final}) -> {os.path.relpath(path,root)}")
+    print(f"   cites experiments: {', '.join(exp_ids)}  | claim {args.claim} verdict_history updated")
+
+
+def cmd_verdict_write(args):
+    """Write a committee VERDICT into verdicts/<PROJ>/<date>/, REQUIRING linked experiment ids that exist.
+    Back-links the verdict into the claim's verdict_history + each experiment's linked_verdicts."""
+    root=inst_root(args)
+    cf=find_obj(root,"claims",args.claim)
+    if not cf: sys.exit(f"❌ claim {args.claim} not found.")
+    claim=load_yaml(cf); pid=claim.get("project_id","PROJ-0000")
+    # validate experiment links (must exist under experiments/**/<EXP>/)
+    exp_ids=[e.strip() for e in (args.experiments or "").split(",") if e.strip()]
+    if not exp_ids:
+        sys.exit("❌ a verdict MUST cite the experiment(s) that informed it: --experiments EXP-xxxx[,EXP-yyyy]")
+    exp_paths=[]
+    for eid in exp_ids:
+        hits=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)
+        if not hits: sys.exit(f"❌ experiment {eid} not found under experiments/ — cannot file a verdict citing it.")
+        exp_paths.append(os.path.relpath(os.path.dirname(hits[0]),root))
+    vid=next_id(root,"verdicts","VERDICT")
+    import datetime as _d
+    date=args.date or _d.datetime.now(_d.timezone.utc).strftime("%Y-%m-%d")
+    votes=[v.strip() for v in (args.votes or "").split(",") if v.strip()]  # role:vote pairs
+    obj={"verdict_id":vid,"claim_id":args.claim,"project_id":pid,"date":date,
+         "experiment_ids":exp_ids,"experiment_paths":exp_paths,
+         "committee_version":args.committee_version or "v001","prompt_versions":{},
+         "reviewer_votes":[dict(zip(["role","vote"],v.split(":",1))) for v in votes],
+         "final_verdict":args.final,"fatal_objections":[],"required_evidence":[],
+         "map_delta_proposals":[],"baseline_requirements":[],"created_at":NOW()}
+    d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
+    # back-link claim + experiments
+    claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final})
+    claim["last_updated"]=NOW(); dump_yaml(cf,claim)
+    for eid in exp_ids:
+        ep=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)[0]
+        e=load_yaml(ep); e.setdefault("linked_verdicts",[]).append(vid); dump_yaml(ep,e)
+    print(f"✅ {vid} ({args.final}) -> {os.path.relpath(path,root)}")
+    print(f"   cites experiments: {', '.join(exp_ids)}  | claim {args.claim} verdict_history updated")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -577,6 +651,20 @@ def main():
     sub.add_parser("init").set_defaults(fn=cmd_init)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("projects").set_defaults(fn=cmd_projects)
+    vw=sub.add_parser("verdict"); vws=vw.add_subparsers(dest="sub",required=True)
+    vwr=vws.add_parser("write")
+    vwr.add_argument("--claim",required=True); vwr.add_argument("--final",required=True,help="green|yellow|red|kill|promote|needs-more-evidence")
+    vwr.add_argument("--experiments",required=True,help="REQUIRED EXP-xxxx[,EXP-yyyy] that informed the verdict")
+    vwr.add_argument("--votes",help="role:vote comma list, e.g. novelty_killer:yellow,area_chair:yellow")
+    vwr.add_argument("--committee-version",dest="committee_version"); vwr.add_argument("--date")
+    vwr.set_defaults(fn=cmd_verdict_write)
+    vw=sub.add_parser("verdict"); vws=vw.add_subparsers(dest="sub",required=True)
+    vwr=vws.add_parser("write")
+    vwr.add_argument("--claim",required=True); vwr.add_argument("--final",required=True,help="green|yellow|red|kill|promote|needs-more-evidence")
+    vwr.add_argument("--experiments",required=True,help="REQUIRED EXP-xxxx[,EXP-yyyy] that informed the verdict")
+    vwr.add_argument("--votes",help="role:vote comma list, e.g. novelty_killer:yellow,area_chair:yellow")
+    vwr.add_argument("--committee-version",dest="committee_version"); vwr.add_argument("--date")
+    vwr.set_defaults(fn=cmd_verdict_write)
     # env discovery
     ev = sub.add_parser("env"); evs = ev.add_subparsers(dest="sub", required=True)
     evd = evs.add_parser("discover"); evd.add_argument("--probe", action="store_true", help="run config probe_cmd per node")
