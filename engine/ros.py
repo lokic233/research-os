@@ -538,11 +538,22 @@ def cmd_exp_gc(args):
     """BUG-23: retire orphan pending experiments (registered but never completed) + clear their dangling
     active_experiments back-links on claims. Reports what it would do; --apply to act."""
     root=inst_root(args)
-    orphans=[]
+    import time as _t
+    orphans=[]; skipped=[]
+    stale_min = args.stale_min if getattr(args,"stale_min",None) is not None else 30
     for ef in glob.glob(os.path.join(root,"experiments","**","experiment.yaml"),recursive=True):
         e=load_yaml(ef,{}) or {}
-        if e.get("status")=="pending" and not e.get("result_effect"):
-            orphans.append((e.get("exp_id"),e.get("claim_id"),os.path.dirname(ef)))
+        if e.get("status")!="pending" or e.get("result_effect"): continue
+        d=os.path.dirname(ef)
+        # BUG-24 SAFETY: never retire a pending exp that has ANY artifacts (active researcher mid-run)
+        arts=[p for p in glob.glob(os.path.join(d,"**","*"),recursive=True)
+              if os.path.isfile(p) and os.path.basename(p)!="experiment.yaml"]
+        if arts: skipped.append((e.get("exp_id"),"has artifacts (active?)")); continue
+        # never retire one modified within the stale window (recent = possibly mid-flight)
+        age_min=(_t.time()-os.path.getmtime(ef))/60.0
+        if age_min < stale_min: skipped.append((e.get("exp_id"),f"modified {age_min:.0f}m ago < {stale_min}m")); continue
+        orphans.append((e.get("exp_id"),e.get("claim_id"),d))
+    for eid,why in skipped: print(f"  ⏭  skip {eid}: {why}")
     if not orphans: print("✅ no orphan pending experiments"); return
     print(f"{'RETIRING' if args.apply else 'WOULD RETIRE'} {len(orphans)} orphan pending experiment(s):")
     for eid,cid,d in orphans:
@@ -748,6 +759,7 @@ def main():
     ec.add_argument("--summary", required=True); ec.add_argument("--revival")
     ec.set_defaults(fn=cmd_exp_complete)
     eg = esub.add_parser("gc"); eg.add_argument("--apply", action="store_true", help="actually retire (default dry-run)")
+    eg.add_argument("--stale-min", dest="stale_min", type=int, default=30, help="min age (min) before a pending exp is gc-eligible")
     eg.set_defaults(fn=cmd_exp_gc)
     ed = esub.add_parser("dispatch")
     ed.add_argument("--exp", required=True); ed.add_argument("--node", required=True)
