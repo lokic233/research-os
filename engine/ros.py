@@ -444,6 +444,92 @@ def cmd_exp_dispatch(args):
     print(f"   NOTE: enforce the host-RAM watchdog on BOTH allocation AND teardown; use os._exit().")
 
 
+
+# ============================ progress reporting (researcher -> orchestrator) ============================
+def cmd_report(args):
+    """Researcher pushes a STRUCTURED PROGRESS REPORT (not just liveness). Appends to the agent's
+    report log AND drops an entry in the orchestrator inbox. Bumps heartbeat. Mandatory every ~10m."""
+    import json as _json
+    root = inst_root(args); rd = runtime_dir(root)
+    os.makedirs(os.path.join(rd, "reports"), exist_ok=True)
+    os.makedirs(os.path.join(rd, "orchestrator"), exist_ok=True)
+    rec = {"ts": NOW(), "agent": args.agent, "role": args.role or "",
+           "done": args.done or "", "doing": args.doing or "", "blocked": args.blocked or "",
+           "need": args.need or "", "next": args.next or "", "claim": args.claim or "", "exp": args.exp or ""}
+    # append to per-agent report log
+    with open(os.path.join(rd, "reports", f"{args.agent}.jsonl"), "a") as f:
+        f.write(_json.dumps(rec) + "\n")
+    # inbox entry for the orchestrator (questions/blocks flagged for action)
+    inbox = load_yaml(os.path.join(rd, "orchestrator", "inbox.yaml"), {"items": []}) or {"items": []}
+    needs_action = bool(args.blocked or args.need)
+    inbox["items"].append({**rec, "acked": False, "needs_action": needs_action})
+    dump_yaml(os.path.join(rd, "orchestrator", "inbox.yaml"), inbox)
+    # bump heartbeat too (a report IS liveness)
+    hp = os.path.join(rd, "agents", f"{args.agent}.yaml"); hb = load_yaml(hp, {}) or {}
+    hb.update({"agent_id": args.agent, "last_heartbeat": NOW(), "status": "running",
+               "note": (args.doing or args.done or "")[:80],
+               "heartbeat_count": int(hb.get("heartbeat_count", 0)) + 1,
+               "last_report_ts": NOW()})
+    if args.role: hb["role"] = args.role
+    dump_yaml(hp, hb)
+    flag = " ⚠️ NEEDS ORCHESTRATOR ACTION" if needs_action else ""
+    print(f"📋 report logged for {args.agent}{flag}")
+    if needs_action and args.ping_orchestrator:
+        print(f"   (blocker/question flagged — orchestrator should be pinged via agent_run.message)")
+
+def cmd_inbox(args):
+    """ORCHESTRATOR reads pending researcher reports. --action-only shows just blocks/questions.
+    This is what prevents the orchestrator from sitting idle: it polls progress + acts on needs."""
+    root = inst_root(args); rd = runtime_dir(root)
+    inbox = load_yaml(os.path.join(rd, "orchestrator", "inbox.yaml"), {"items": []}) or {"items": []}
+    items = [i for i in inbox["items"] if not i.get("acked")]
+    if args.action_only: items = [i for i in items if i.get("needs_action")]
+    if not items: print("(inbox empty — no pending reports)"); return
+    print(f"ORCHESTRATOR INBOX — {len(items)} pending:")
+    for i in items:
+        tag = "❗ACTION" if i.get("needs_action") else "  info "
+        print(f"  [{tag}] {i['ts']} {i['agent']} [{i.get('role','')}]")
+        if i.get("done"):    print(f"          done:    {i['done']}")
+        if i.get("doing"):   print(f"          doing:   {i['doing']}")
+        if i.get("blocked"): print(f"          BLOCKED: {i['blocked']}")
+        if i.get("need"):    print(f"          NEEDS:   {i['need']}")
+        if i.get("next"):    print(f"          next:    {i['next']}")
+
+def cmd_inbox_ack(args):
+    root = inst_root(args); rd = runtime_dir(root)
+    p = os.path.join(rd, "orchestrator", "inbox.yaml")
+    inbox = load_yaml(p, {"items": []}) or {"items": []}
+    n = 0
+    for i in inbox["items"]:
+        if not i.get("acked") and (args.all or i.get("agent") == args.agent):
+            i["acked"] = True; i["acked_at"] = NOW(); i["answer"] = args.answer or ""; n += 1
+    dump_yaml(p, inbox)
+    print(f"✅ acked {n} inbox item(s)" + (f" with answer: {args.answer}" if args.answer else ""))
+
+def cmd_reports_age(args):
+    """Monitor helper: which researchers have NOT reported within the window? (silent-researcher detector)"""
+    import datetime as _dt
+    root = inst_root(args); rd = runtime_dir(root); cfg = _cfg(root)
+    win = args.window_min if args.window_min is not None else 10
+    now = _dt.datetime.now(_dt.timezone.utc)
+    silent = []
+    for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
+        a = load_yaml(fn, {}) or {}
+        role = a.get("role","")
+        if "committee" in (a.get("agent_id","")) or role in ("novelty_killer","systems_reviewer","evaluation_prosecutor","theory_skeptic","product_realist","area_chair","orchestrator"):
+            continue  # researchers only
+        lr = a.get("last_report_ts") or a.get("last_heartbeat","")
+        try:
+            age = (now - _dt.datetime.strptime(lr,"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)).total_seconds()/60
+        except: age = 1e9
+        if age > win: silent.append((a.get("agent_id","?"), role, round(age,1)))
+    if silent:
+        print(f"⚠️ {len(silent)} researcher(s) SILENT >{win}m (should have reported):")
+        for aid, role, age in silent: print(f"   - {aid} [{role}] last report {age}m ago")
+    else:
+        print(f"✅ all researchers reported within {win}m")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -465,6 +551,19 @@ def main():
     hb.add_argument("--role"); hb.add_argument("--claim"); hb.add_argument("--exp")
     hb.set_defaults(fn=cmd_heartbeat)
     sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
+    rp = sub.add_parser("report")
+    rp.add_argument("--agent", required=True); rp.add_argument("--role")
+    rp.add_argument("--done"); rp.add_argument("--doing"); rp.add_argument("--blocked")
+    rp.add_argument("--need"); rp.add_argument("--next"); rp.add_argument("--claim"); rp.add_argument("--exp")
+    rp.add_argument("--ping-orchestrator", dest="ping_orchestrator", action="store_true")
+    rp.set_defaults(fn=cmd_report)
+    ib = sub.add_parser("inbox"); ibs = ib.add_subparsers(dest="sub")
+    ib.add_argument("--action-only", dest="action_only", action="store_true"); ib.set_defaults(fn=cmd_inbox)
+    iba = ibs.add_parser("ack"); iba.add_argument("--agent"); iba.add_argument("--all", action="store_true")
+    iba.add_argument("--answer"); iba.add_argument("--action-only", dest="action_only", action="store_true")
+    iba.set_defaults(fn=cmd_inbox_ack)
+    ra = sub.add_parser("reports-age"); ra.add_argument("--window-min", dest="window_min", type=int, default=10)
+    ra.set_defaults(fn=cmd_reports_age)
     # env discovery
     ev = sub.add_parser("env"); evs = ev.add_subparsers(dest="sub", required=True)
     evd = evs.add_parser("discover"); evd.add_argument("--probe", action="store_true", help="run config probe_cmd per node")
@@ -480,6 +579,19 @@ def main():
     hb.add_argument("--role"); hb.add_argument("--claim"); hb.add_argument("--exp")
     hb.set_defaults(fn=cmd_heartbeat)
     sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
+    rp = sub.add_parser("report")
+    rp.add_argument("--agent", required=True); rp.add_argument("--role")
+    rp.add_argument("--done"); rp.add_argument("--doing"); rp.add_argument("--blocked")
+    rp.add_argument("--need"); rp.add_argument("--next"); rp.add_argument("--claim"); rp.add_argument("--exp")
+    rp.add_argument("--ping-orchestrator", dest="ping_orchestrator", action="store_true")
+    rp.set_defaults(fn=cmd_report)
+    ib = sub.add_parser("inbox"); ibs = ib.add_subparsers(dest="sub")
+    ib.add_argument("--action-only", dest="action_only", action="store_true"); ib.set_defaults(fn=cmd_inbox)
+    iba = ibs.add_parser("ack"); iba.add_argument("--agent"); iba.add_argument("--all", action="store_true")
+    iba.add_argument("--answer"); iba.add_argument("--action-only", dest="action_only", action="store_true")
+    iba.set_defaults(fn=cmd_inbox_ack)
+    ra = sub.add_parser("reports-age"); ra.add_argument("--window-min", dest="window_min", type=int, default=10)
+    ra.set_defaults(fn=cmd_reports_age)
     sp = sub.add_parser("seed"); ssub = sp.add_subparsers(dest="sub", required=True)
     sn = ssub.add_parser("new"); sn.add_argument("--claim", required=True); sn.add_argument("--why")
     sn.add_argument("--project"); sn.add_argument("--owner"); sn.add_argument("--prompt-version", dest="prompt_version")

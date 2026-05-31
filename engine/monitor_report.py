@@ -69,6 +69,27 @@ for ag in agents:
     if any(k in note.lower() for k in ["?","blocked","need ","question","waiting","approve","help"]):
         qa.append((ag.get("agent_id","?"),note))
 
+# --- progress reports in window + silent researchers + pending inbox ---
+import datetime as _dt2
+reports_in_window=0; reporters=set()
+for fn in glob.glob(os.path.join(rd,"reports","*.jsonl")):
+    for ln in open(fn,errors="ignore"):
+        try: r=json.loads(ln)
+        except: continue
+        am=age_min(r.get("ts","")); 
+        if am is not None and am<=W:
+            reports_in_window+=1; reporters.add(r.get("agent",""))
+silent_researchers=[]
+for ag in agents:
+    aid=ag.get("agent_id",""); role=ag.get("role","")
+    if "committee" in aid or role in ("novelty_killer","systems_reviewer","evaluation_prosecutor","theory_skeptic","product_realist","area_chair","orchestrator"): continue
+    lr=ag.get("last_report_ts") or ag.get("last_heartbeat","")
+    am=age_min(lr)
+    if am is None or am>W: silent_researchers.append((aid,role,am))
+inbox=load(os.path.join(rd,"orchestrator","inbox.yaml"),{"items":[]}) or {"items":[]}
+pending=[i for i in inbox["items"] if not i.get("acked")]
+pending_action=[i for i in pending if i.get("needs_action")]
+
 # --- write report ---
 os.makedirs(os.path.join(rd,"monitor"),exist_ok=True)
 ts=NOW.strftime("%Y%m%d-%H%M%S")
@@ -77,6 +98,10 @@ def P(x): lines.append(x); print(x)
 P(f"# Monitor Report — {NOW.strftime('%H:%M UTC')} (window={W}m)")
 P(f"orchestrator: {next((f'{r[4]} ({r[3]}m)' for r in roster if r[1]=='orchestrator'),'NOT FOUND')}")
 P(f"## Δ last {W}m: +{len(new_claims)} claims, +{len(done_exps)} experiments completed, +{len(new_verdicts)} verdicts")
+P(f"## Progress reports last {W}m: {reports_in_window} from {len(reporters)} researcher(s)")
+if silent_researchers: P(f"## ⚠️ SILENT researchers (>{W}m no report — orchestrator may sit idle): " + ", ".join(f"{a}[{r}]" for a,r,_ in silent_researchers))
+P(f"## Orchestrator inbox: {len(pending)} pending ({len(pending_action)} need action)")
+for i in pending_action: P(f"   ❗ {i.get('agent')}: BLOCKED={i.get('blocked','')[:50]} NEED={i.get('need','')[:40]}")
 P(f"## Researchers ({len(researchers)}): " + (", ".join(f"{r[1]}={r[4]}" for r in researchers) or "none"))
 for r in researchers: P(f"   - {r[0]} [{r[1]}] {r[4]} last={r[3]}m :: {r[5][:60]}")
 P(f"## Committee ({len(committee)} alive-registered):")
@@ -93,7 +118,7 @@ else: P(f"## ✅ no dead agents")
 side={"ts":ts,"window_min":W,"delta":{"claims":len(new_claims),"experiments":len(done_exps),"verdicts":len(new_verdicts)},
       "researchers":[{"id":r[0],"role":r[1],"state":r[4],"age_min":r[3]} for r in researchers],
       "committee_runs":[{"run":n,"status":s,"votes":v} for n,s,v in comm_runs],
-      "qa":[{"id":a_,"note":n} for a_,n in qa],"dead":[r[0] for r in dead],"stale":[r[0] for r in stale]}
+      "reports_in_window":reports_in_window,"silent_researchers":[a for a,_,_ in silent_researchers],"inbox_pending":len(pending),"inbox_need_action":len(pending_action),"qa":[{"id":a_,"note":n} for a_,n in qa],"dead":[r[0] for r in dead],"stale":[r[0] for r in stale]}
 open(os.path.join(rd,"monitor",f"report-{ts}.md"),"w").write("\n".join(lines))
 open(os.path.join(rd,"monitor",f"report-{ts}.json"),"w").write(json.dumps(side,indent=2))
 print(f"\n(report saved: runtime/monitor/report-{ts}.md)")

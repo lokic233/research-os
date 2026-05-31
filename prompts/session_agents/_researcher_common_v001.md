@@ -10,5 +10,10 @@ RULES (all researchers):
 - SAFETY (mandatory): before any GPU VMM / large-allocation / large-mapping probe, read the instance's
   learning/ postmortems. Cap allocations small; watchdog host-RAM on BOTH allocation AND teardown; prefer
   os._exit() to skip per-object teardown; never autonomously trigger node repairs.
-- Push a liveness kick to the supervisor every ~15m while running (reasoning/long-runs are fine; just kick).
+- **MANDATORY PROGRESS REPORT every ~10m** (not just liveness): run
+  `ros report --agent <id> --role <role> --done "<what I finished>" --doing "<current>" --next "<next step>"`
+  and add `--blocked "<x>" --need "<x>"` if you need the orchestrator. A liveness heartbeat says "alive";
+  a REPORT says "here is what I produced + what I need" — the orchestrator acts on reports, not heartbeats.
+  Silence makes the orchestrator go idle. If you have a question for the orchestrator, file it via --need
+  and it lands in the orchestrator inbox (it will answer + ack). Report at every meaningful step, min every 10m.
 - Record the prompt version (v001) on outputs.
