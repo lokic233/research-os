@@ -31,14 +31,31 @@ def dump_yaml(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f: YAML.safe_dump(obj, f, sort_keys=False, default_flow_style=False)
 
+def find_obj(root, kind, oid):
+    """Find OID.yaml anywhere under registry/<kind>/ (now nested PROJ-x/<date>/). Returns path or None."""
+    hits = glob.glob(os.path.join(reg_dir(root, kind), "**", f"{oid}.yaml"), recursive=True)
+    return hits[0] if hits else None
+
+def obj_dir(root, kind, project_id, date=None):
+    """Target dir for a NEW object: registry/<kind>/<PROJ>/<date>/."""
+    import datetime as _d
+    date = date or _d.datetime.now(_d.timezone.utc).strftime("%Y-%m-%d")
+    d = os.path.join(reg_dir(root, kind), project_id or "PROJ-0000", date)
+    os.makedirs(d, exist_ok=True); return d
+
 def next_id(root, kind, prefix):
-    """Scan registry/<kind>/ for PREFIX-NNNN.yaml, return next zero-padded id."""
-    d = reg_dir(root, kind)
-    os.makedirs(d, exist_ok=True)
+    """Next zero-padded id. Experiments live as experiments/<date>/<EXP-id>/ (dir names);
+    other objects as registry/<kind>/**/PREFIX-*.yaml. Scan the RIGHT place to avoid id reuse."""
     mx = 0
-    for fn in glob.glob(os.path.join(d, f"{prefix}-*.yaml")):
-        m = re.search(rf"{prefix}-(\d+)", os.path.basename(fn))
-        if m: mx = max(mx, int(m.group(1)))
+    if kind == "experiments":
+        for dn in glob.glob(os.path.join(root, "experiments", "**", f"{prefix}-*"), recursive=True):
+            m = re.search(rf"{prefix}-(\d+)", os.path.basename(dn.rstrip("/")))
+            if m: mx = max(mx, int(m.group(1)))
+    else:
+        d = reg_dir(root, kind); os.makedirs(d, exist_ok=True)
+        for fn in glob.glob(os.path.join(d, "**", f"{prefix}-*.yaml"), recursive=True):
+            m = re.search(rf"{prefix}-(\d+)", os.path.basename(fn))
+            if m: mx = max(mx, int(m.group(1)))
     return f"{prefix}-{mx+1:04d}"
 
 def _fingerprint(text):
@@ -52,7 +69,7 @@ def cemetery_conflict(root, claim_text):
     fp = _fingerprint(claim_text)
     if not fp: return None
     best = None
-    for fn in glob.glob(reg_dir(root, "cemetery", "DEAD-*.yaml")):
+    for fn in glob.glob(reg_dir(root, "cemetery", "**", "DEAD-*.yaml"), recursive=True):
         dead = load_yaml(fn, {})
         cand = set()
         for pat in (dead.get("duplicate_patterns") or []): cand |= _fingerprint(pat)
@@ -97,7 +114,7 @@ def cmd_seed_new(args):
     }
     if conflict and args.force_revive:
         obj["revival_conditions"] = f"REVIVED from {conflict['dead_id']} with new evidence: {args.force_revive}"
-    path = reg_dir(root, "claims", f"{cid}.yaml")
+    path = os.path.join(obj_dir(root, "claims", obj["project_id"]), f"{cid}.yaml")
     dump_yaml(path, obj)
     print(f"✅ {cid} created -> {os.path.relpath(path, root)}")
     if conflict: print(f"   ⚠️ force-revived past {conflict['dead_id']}")
@@ -107,8 +124,8 @@ def cmd_exp_register(args):
     root = inst_root(args)
     # claim must exist (unless explicitly infra probe)
     if args.claim and args.claim != "none":
-        cf = reg_dir(root, "claims", f"{args.claim}.yaml")
-        if not os.path.exists(cf):
+        cf = find_obj(root, "claims", args.claim)
+        if not cf:
             sys.exit(f"❌ claim {args.claim} not found. Register the claim/seed first.")
     eid = next_id(root, "experiments", "EXP")
     obj = {
@@ -122,11 +139,15 @@ def cmd_exp_register(args):
         "artifacts_path": f"experiments/{eid}/", "reproducibility": "", "linked_verdicts": [],
         "started_at": "", "completed_at": "", "prompt_version": args.prompt_version or "",
     }
-    dump_yaml(reg_dir(root, "experiments", f"{eid}.yaml"), obj)
-    os.makedirs(os.path.join(root, "experiments", eid, "results"), exist_ok=True)
-    os.makedirs(os.path.join(root, "experiments", eid, "logs"), exist_ok=True)
+    import datetime as _d
+    _date = _d.datetime.now(_d.timezone.utc).strftime("%Y-%m-%d")
+    _ed = os.path.join(root, "experiments", _date, eid)
+    obj["artifacts_path"] = f"experiments/{_date}/{eid}/"
+    os.makedirs(os.path.join(_ed, "results"), exist_ok=True)
+    os.makedirs(os.path.join(_ed, "logs"), exist_ok=True)
+    dump_yaml(os.path.join(_ed, "experiment.yaml"), obj)
     gpu = obj["needs_gpu"]
-    print(f"✅ {eid} registered (level {args.level}, {'GPU' if gpu else 'CPU-only'}). Artifact dir: experiments/{eid}/")
+    print(f"✅ {eid} registered (level {args.level}, {'GPU' if gpu else 'CPU-only'}). Artifact dir: {obj['artifacts_path']}")
     print(f"   budget: {obj['resource_budget']}")
     if gpu:
         print(f"   ⚠️ GPU experiment — researchers CANNOT run this directly. Orchestrator must:"
@@ -136,8 +157,9 @@ def cmd_exp_register(args):
 
 def cmd_exp_complete(args):
     root = inst_root(args)
-    ef = reg_dir(root, "experiments", f"{args.exp}.yaml")
-    exp = load_yaml(ef)
+    hits = glob.glob(os.path.join(root, "experiments", "**", args.exp, "experiment.yaml"), recursive=True)
+    ef = hits[0] if hits else None
+    exp = load_yaml(ef) if ef else None
     if not exp: sys.exit(f"❌ {args.exp} not found.")
     VALID = {"kill","weaken","keep-exploring","promote","archive","support"}
     if args.effect not in VALID: sys.exit(f"❌ effect must be one of {VALID}")
@@ -148,7 +170,7 @@ def cmd_exp_complete(args):
     cid = exp.get("claim_id")
     note = []
     if cid:
-        cf = reg_dir(root, "claims", f"{cid}.yaml"); claim = load_yaml(cf)
+        cf = find_obj(root, "claims", cid); claim = load_yaml(cf) if cf else None
         if claim:
             entry = {"exp_id": args.exp, "summary": args.summary, "data_path": exp["artifacts_path"]}
             if args.effect in ("kill","weaken"): claim["negative_evidence"].append(entry)
@@ -162,7 +184,7 @@ def cmd_exp_complete(args):
             # auto-cemetery on kill
             if args.effect == "kill":
                 did = next_id(root, "cemetery", "DEAD")
-                dump_yaml(reg_dir(root, "cemetery", f"{did}.yaml"), {
+                dump_yaml(os.path.join(obj_dir(root,"cemetery",claim.get("project_id","PROJ-0001")), f"{did}.yaml"), {
                     "dead_id": did, "original_claim_id": cid, "original_claim": claim.get("claim",""),
                     "reason_killed": args.summary, "killing_verdict": "", "killing_experiments": [args.exp],
                     "duplicate_patterns": [claim.get("claim",""), " ".join(sorted(_fingerprint(claim.get("claim",""))))], "revival_conditions": args.revival or "",
@@ -175,15 +197,15 @@ def cmd_exp_complete(args):
 
 def cmd_status(args):
     root = inst_root(args)
-    def count(kind, pre): return len(glob.glob(reg_dir(root, kind, f"{pre}-*.yaml")))
+    def count(kind, pre): return len(glob.glob(reg_dir(root, kind, "**", f"{pre}-*.yaml"), recursive=True))
     print(f"research-os instance: {root}")
     print(f"  claims:      {count('claims','CLAIM')}")
-    print(f"  experiments: {count('experiments','EXP')}")
+    print(f"  experiments: {len(glob.glob(os.path.join(root,'experiments','**','experiment.yaml'),recursive=True))}")
     print(f"  verdicts:    {count('verdicts','VERDICT')}")
     print(f"  cemetery:    {count('cemetery','DEAD')}")
     # claim status breakdown
     by = {}
-    for fn in glob.glob(reg_dir(root,'claims','CLAIM-*.yaml')):
+    for fn in glob.glob(reg_dir(root,'claims','**','CLAIM-*.yaml'), recursive=True):
         c = load_yaml(fn,{}); by[c.get('status','?')] = by.get(c.get('status','?'),0)+1
     if by: print("  claim status:", ", ".join(f"{k}={v}" for k,v in sorted(by.items())))
 
@@ -417,7 +439,8 @@ def cmd_exp_dispatch(args):
     """ORCHESTRATOR-ONLY: trigger a GPU experiment onto a node, after the safety/budget/fragile gate.
     This is INVARIANT 3: researchers/committee never touch GPU directly; only the orchestrator dispatches."""
     root = inst_root(args); cfg = _cfg(root)
-    ef = reg_dir(root, "experiments", f"{args.exp}.yaml"); exp = load_yaml(ef)
+    hits = glob.glob(os.path.join(root, "experiments", "**", args.exp, "experiment.yaml"), recursive=True)
+    ef = hits[0] if hits else None; exp = load_yaml(ef) if ef else None
     if not exp: sys.exit(f"❌ {args.exp} not found.")
     if exp.get("status") not in ("pending",): sys.exit(f"❌ {args.exp} is '{exp.get('status')}', not dispatchable.")
     # find the node in config
