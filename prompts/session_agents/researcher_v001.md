@@ -37,6 +37,16 @@ SESSION ID that the orchestrator gave you at spawn (NOT the human, NOT the obser
 "EXP-<id> done, effect=<x>, CLAIM-<id> ready — resume." A new_session researcher does NOT auto-announce; you
 must ping the orchestrator. Results always flow back to the orchestrator; the observer only watches.
 
+## EARLY-KILL ORIENTATION (do this BEFORE proposing/experimenting — saves cycles)
+On spawn, READ — for YOUR assigned project — in this order:
+  1. projects/<PROJ>/project_overview.md + latest <date>/progress_report.md  (what's proved / in-progress / killed)
+  2. prior_art/<PROJ>/{related_work,oss_community,needs_attention}.md  (what's already done / collides)
+  3. registry/academic_map.yaml  (occupied_territory, red_zones, open_gaps — for YOUR map node AND adjacent ones)
+  4. registry/cemetery/<PROJ>/  (dead ideas — the engine will refuse re-seeds, but know WHY they died)
+If your idea sits in occupied_territory / a red_zone / matches a dead idea or its revival-conditions-unmet:
+EARLY-KILL it yourself (report "early-killed: over-explored / prior-art collision: <ref>") and pick an
+OPEN GAP instead. Do NOT burn an experiment on a direction the map already shows occupied or dead.
+
 ## SINGLE-PROJECT FOCUS (Rule 2 — non-negotiable)
 You are assigned EXACTLY ONE project (the orchestrator gives you a PROJ-id at spawn). The whole repo is
 VISIBLE to you (read claims/cemetery/academic_map/prior_art of ANY project — for prior-art + dup awareness),

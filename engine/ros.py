@@ -541,8 +541,12 @@ def cmd_verdict_write(args):
          "experiment_ids":exp_ids,"experiment_paths":exp_paths,
          "committee_version":args.committee_version or comm.get("rubric_version","v001"),"prompt_versions":{},
          "reviewer_votes":parsed,"green_rule":rule,
-         "final_verdict":args.final,"fatal_objections":[],"required_evidence":[],
-         "map_delta_proposals":[],"baseline_requirements":[],"created_at":NOW()}
+         "final_verdict":args.final,
+         "fatal_objections":[x.strip() for x in (args.fatal or "").split(";") if x.strip()],
+         "required_evidence":[x.strip() for x in (args.required or "").split(";") if x.strip()],
+         "map_delta_proposals":[x.strip() for x in (args.map_delta or "").split(";") if x.strip()],
+         "baseline_requirements":[x.strip() for x in (args.baselines or "").split(";") if x.strip()],
+         "created_at":NOW()}
     d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
     # back-link claim + experiments
     claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final})
@@ -622,6 +626,10 @@ def main():
     vwr.add_argument("--votes",help="role:vote comma list, e.g. novelty_killer:yellow,area_chair:yellow")
     vwr.add_argument("--committee-version",dest="committee_version"); vwr.add_argument("--date")
     vwr.add_argument("--override-rule",dest="override_rule",action="store_true",help="bypass green_rule vote-count check (needs justification)")
+    vwr.add_argument("--fatal",help="fatal_objections, ';'-separated")
+    vwr.add_argument("--required",help="required_evidence to advance, ';'-separated")
+    vwr.add_argument("--map-delta",dest="map_delta",help="academic-map delta proposals, ';'-separated")
+    vwr.add_argument("--baselines",help="baseline_requirements, ';'-separated")
     vwr.set_defaults(fn=cmd_verdict_write)
     # env discovery
     ev = sub.add_parser("env"); evs = ev.add_subparsers(dest="sub", required=True)
