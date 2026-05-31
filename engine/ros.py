@@ -110,6 +110,8 @@ def cmd_seed_new(args):
         "mandatory_baselines": [], "academic_map_nodes": [],
         "supporting_evidence": [], "negative_evidence": [], "verdict_history": [],
         "revival_conditions": "", "owner": args.owner or "", "prompt_version": args.prompt_version or "",
+        "lifecycle_state": "drafted", "next_action": "prior-art + skeptic check, then design a bounded probe",
+        "blocking_on": "", "active_experiments": [],
         "created_at": NOW(), "last_updated": NOW(),
     }
     if conflict and args.force_revive:
@@ -154,6 +156,15 @@ def cmd_exp_register(args):
     os.makedirs(os.path.join(_ed, "results"), exist_ok=True)
     os.makedirs(os.path.join(_ed, "logs"), exist_ok=True)
     dump_yaml(os.path.join(_ed, "experiment.yaml"), obj)
+    # lifecycle: mark the claim as having a running experiment (resume pointer)
+    if args.claim and args.claim != "none":
+        _cf = find_obj(root, "claims", args.claim); _c = load_yaml(_cf) if _cf else None
+        if _c:
+            _c["lifecycle_state"] = "experiment_running"
+            _c.setdefault("active_experiments", [])
+            if eid not in _c["active_experiments"]: _c["active_experiments"].append(eid)
+            _c["next_action"] = f"await {eid} result, then ros exp complete --exp {eid} --effect ..."
+            _c["last_updated"] = NOW(); dump_yaml(_cf, _c)
     gpu = obj["needs_gpu"]
     print(f"✅ {eid} registered (level {args.level}, {'GPU' if gpu else 'CPU-only'}). Artifact dir: {obj['artifacts_path']}")
     print(f"   budget: {obj['resource_budget']}")
@@ -186,6 +197,14 @@ def cmd_exp_complete(args):
             if args.effect == "kill": claim["status"] = "killed"
             elif args.effect == "weaken": claim["status"] = "weakened"
             elif args.effect == "promote": claim["status"] = "promoted"
+            # lifecycle: experiment done -> evidence_ready (awaiting review) unless killed
+            claim.setdefault("active_experiments", [])
+            if args.exp in claim["active_experiments"]: claim["active_experiments"].remove(args.exp)
+            if args.effect == "kill":
+                claim["lifecycle_state"] = "done"; claim["next_action"] = "killed -> cemetery; no further action"
+            else:
+                claim["lifecycle_state"] = "evidence_ready"
+                claim["next_action"] = f"review evidence from {args.exp}; convene committee if candidate-grade"
             claim["last_updated"] = NOW()
             dump_yaml(cf, claim)
             note.append(f"claim {cid} -> {claim['status']}")
@@ -527,12 +546,60 @@ def cmd_verdict_write(args):
     d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
     # back-link claim + experiments
     claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final})
+    if args.final in ("promote","kill"):
+        claim["lifecycle_state"]="done"; claim["next_action"]=f"{args.final}ed by {vid}"
+    else:
+        claim["lifecycle_state"]="verdict_recorded"
+        claim["next_action"]=f"{vid}={args.final}: address required_evidence to advance"
     claim["last_updated"]=NOW(); dump_yaml(cf,claim)
     for eid in exp_ids:
         ep=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)[0]
         e=load_yaml(ep); e.setdefault("linked_verdicts",[]).append(vid); dump_yaml(ep,e)
     print(f"✅ {vid} ({args.final}) -> {os.path.relpath(path,root)}")
     print(f"   votes: {len(parsed)}/{len(members) or 6}  cites: {', '.join(exp_ids)}  | claim {args.claim} updated")
+
+
+VALID_LIFECYCLE={"drafted","prior_art_pending","experiment_designing","experiment_running",
+  "evidence_ready","committee_pending","verdict_recorded","blocked","done"}
+
+def cmd_claim_advance(args):
+    """Explicitly set a claim's lifecycle_state + next_action (resume pointer). For phases the
+    auto-transitions don't cover (e.g. committee_pending, blocked)."""
+    root=inst_root(args); cf=find_obj(root,"claims",args.claim)
+    if not cf: sys.exit(f"❌ claim {args.claim} not found.")
+    if args.state not in VALID_LIFECYCLE:
+        sys.exit(f"❌ state must be one of {sorted(VALID_LIFECYCLE)}")
+    c=load_yaml(cf); old=c.get("lifecycle_state","?")
+    c["lifecycle_state"]=args.state
+    if args.next is not None: c["next_action"]=args.next
+    if args.blocking is not None: c["blocking_on"]=args.blocking
+    if args.state!="blocked": c["blocking_on"]=c.get("blocking_on","") if args.blocking else ""
+    c["last_updated"]=NOW(); dump_yaml(cf,c)
+    print(f"✅ {args.claim}: {old} -> {args.state}")
+    if c.get("next_action"): print(f"   next: {c['next_action']}")
+
+def cmd_resume(args):
+    """RESUME DASHBOARD: every claim not in a terminal state, with its lifecycle phase + next_action.
+    A fresh/rebooted orchestrator runs this FIRST to pick up paused work from exactly where it stopped."""
+    root=inst_root(args)
+    rows=[]
+    for fn in glob.glob(reg_dir(root,"claims","**","CLAIM-*.yaml"),recursive=True):
+        c=load_yaml(fn,{}) or {}
+        ls=c.get("lifecycle_state","drafted")
+        if ls=="done": continue
+        rows.append((c.get("claim_id","?"),c.get("project_id","?"),ls,c.get("status","?"),
+                     c.get("active_experiments",[]),c.get("next_action",""),c.get("blocking_on","")))
+    if not rows: print("✅ nothing in-flight — all claims terminal (done). Open a new seed."); return
+    order={s:i for i,s in enumerate(["blocked","committee_pending","evidence_ready","experiment_running",
+        "experiment_designing","prior_art_pending","verdict_recorded","drafted"])}
+    rows.sort(key=lambda r: order.get(r[2],99))
+    print(f"IN-FLIGHT CLAIMS ({len(rows)}) — resume from here:")
+    for cid,pid,ls,st,act,nxt,blk in rows:
+        flag=" ⛔" if ls=="blocked" else ""
+        print(f"  [{ls:18}] {cid} ({pid}) status={st}{flag}")
+        if act: print(f"      active_exp: {', '.join(act)}")
+        if blk: print(f"      blocked_on: {blk}")
+        if nxt: print(f"      NEXT: {nxt}")
 
 
 def main():
@@ -542,6 +609,12 @@ def main():
     sub.add_parser("init").set_defaults(fn=cmd_init)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("projects").set_defaults(fn=cmd_projects)
+    sub.add_parser("resume").set_defaults(fn=cmd_resume)
+    ca=sub.add_parser("claim"); cas=ca.add_subparsers(dest="sub",required=True)
+    cav=cas.add_parser("advance")
+    cav.add_argument("--claim",required=True); cav.add_argument("--state",required=True,help="lifecycle_state")
+    cav.add_argument("--next",help="next_action resume pointer"); cav.add_argument("--blocking",help="if blocked: what it waits on")
+    cav.set_defaults(fn=cmd_claim_advance)
     vw=sub.add_parser("verdict"); vws=vw.add_subparsers(dest="sub",required=True)
     vwr=vws.add_parser("write")
     vwr.add_argument("--claim",required=True); vwr.add_argument("--final",required=True,help="green|yellow|red|kill|promote|needs-more-evidence")

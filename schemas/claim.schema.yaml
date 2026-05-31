@@ -2,8 +2,24 @@
 # Append-only spirit: status/verdict_history grow; never delete, archive instead.
 claim_id: CLAIM-0000              # globally unique, zero-padded
 project_id: PROJ-0000            # owning project (lifecycle state)
-stage: seed                      # seed | exploration | candidate | paper-track | archived
-status: active                  # seed | active | weakened | killed | promoted | archived
+stage: seed                      # PIPELINE position: seed | exploration | candidate | paper-track | archived
+status: active                  # VERDICT health: active | weakened | killed | promoted | archived
+# --- LIFECYCLE (fine-grained workflow phase; the resume pointer) ---
+lifecycle_state: drafted        # the exact phase work is paused at — one of:
+                                #   drafted            (claim written, nothing started)
+                                #   prior_art_pending  (needs prior-art / cemetery dup check)
+                                #   experiment_designing (researcher scoping the probe)
+                                #   experiment_running (EXP registered, awaiting result)
+                                #   evidence_ready     (experiment(s) complete, not yet reviewed)
+                                #   committee_pending  (submitted to committee, awaiting votes)
+                                #   verdict_recorded   (verdict written; status reflects it)
+                                #   blocked            (needs a human/orchestrator decision)
+                                #   done               (terminal: promoted | killed | archived)
+next_action: ""                 # RESUME POINTER: the concrete next step to take (free text, e.g.
+                                #   "dispatch EXP-0007 to devgpu014 with host_mem_floor 300" or
+                                #   "convene committee with packet for CLAIM-0006")
+blocking_on: ""                 # if lifecycle_state=blocked: what/who it waits on
+active_experiments: []          # EXP-ids currently running for this claim (resume watches these)
 claim: ""                       # one-sentence falsifiable claim
 why_it_matters: ""              # the pain point / impact
 novelty_hypothesis: ""          # what is claimed new (mechanism, not naming)
