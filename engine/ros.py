@@ -117,6 +117,7 @@ def cmd_exp_register(args):
         "session_id": args.session or "", "level": args.level, "hardware": args.hardware or "",
         "resource_budget": {"max_wall_clock_minutes": args.max_minutes, "max_gpu_hours": args.max_gpu_hours,
                             "max_memory_gb": args.max_mem_gb, "host_mem_floor_gb": args.host_mem_floor},
+        "needs_gpu": (args.max_gpu_hours or 0) > 0, "dispatched_by": "", "node_lease": "",
         "status": "pending", "result_summary": "", "result_effect": "",
         "artifacts_path": f"experiments/{eid}/", "reproducibility": "", "linked_verdicts": [],
         "started_at": "", "completed_at": "", "prompt_version": args.prompt_version or "",
@@ -124,11 +125,14 @@ def cmd_exp_register(args):
     dump_yaml(reg_dir(root, "experiments", f"{eid}.yaml"), obj)
     os.makedirs(os.path.join(root, "experiments", eid, "results"), exist_ok=True)
     os.makedirs(os.path.join(root, "experiments", eid, "logs"), exist_ok=True)
-    if args.level >= 2:
-        print(f"✅ {eid} registered (level {args.level}) — ⚠️ level>=2 requires orchestrator approval before running.")
-    else:
-        print(f"✅ {eid} registered (level {args.level}). Artifact dir: experiments/{eid}/")
+    gpu = obj["needs_gpu"]
+    print(f"✅ {eid} registered (level {args.level}, {'GPU' if gpu else 'CPU-only'}). Artifact dir: experiments/{eid}/")
     print(f"   budget: {obj['resource_budget']}")
+    if gpu:
+        print(f"   ⚠️ GPU experiment — researchers CANNOT run this directly. Orchestrator must:"
+              f" `ros exp dispatch --exp {eid} --node <node>` (gated on safety/budget/fragile).")
+    if args.level >= 2:
+        print(f"   ⚠️ level>=2 also requires orchestrator approval.")
 
 def cmd_exp_complete(args):
     root = inst_root(args)
@@ -408,6 +412,38 @@ def cmd_liveness(args):
     if dead: print(f"  ⚠️ DEAD (past {grace}m grace — orchestrator should revive): {', '.join(dead)}")
 
 
+
+def cmd_exp_dispatch(args):
+    """ORCHESTRATOR-ONLY: trigger a GPU experiment onto a node, after the safety/budget/fragile gate.
+    This is INVARIANT 3: researchers/committee never touch GPU directly; only the orchestrator dispatches."""
+    root = inst_root(args); cfg = _cfg(root)
+    ef = reg_dir(root, "experiments", f"{args.exp}.yaml"); exp = load_yaml(ef)
+    if not exp: sys.exit(f"❌ {args.exp} not found.")
+    if exp.get("status") not in ("pending",): sys.exit(f"❌ {args.exp} is '{exp.get('status')}', not dispatchable.")
+    # find the node in config
+    node = next((n for n in (cfg.get("compute_nodes") or []) if n.get("name")==args.node), None)
+    if not node: sys.exit(f"❌ node '{args.node}' not in config compute_nodes.")
+    budget = exp.get("resource_budget", {})
+    floor = budget.get("host_mem_floor_gb", 0) or 0
+    # SAFETY GATE
+    if node.get("fragile") and floor <= 0:
+        sys.exit(f"❌ SAFETY: node '{args.node}' is fragile and exp {args.exp} has no host_mem_floor_gb. "
+                 f"Re-register with --host-mem-floor (watchdog) before dispatch. (See learning/ postmortems.)")
+    lvl = exp.get("level", 0)
+    bcfg = (cfg.get("budgets") or {}).get(f"level{lvl}", {})
+    if bcfg.get("requires_orchestrator_approval") and not args.approve:
+        sys.exit(f"❌ level {lvl} requires orchestrator approval: re-run with --approve.")
+    if bcfg.get("requires_explicit_human_approval") and not args.human_approved:
+        sys.exit(f"❌ level {lvl} (dangerous) requires explicit human approval: re-run with --human-approved.")
+    exp["status"] = "running"; exp["started_at"] = NOW()
+    exp["dispatched_by"] = args.by or "orchestrator"
+    exp["node_lease"] = f"{args.node}:{exp.get('exp_id')}"
+    dump_yaml(ef, exp)
+    print(f"🚀 dispatched {args.exp} -> {args.node} ({node.get('gpu_type','?')}, fragile={bool(node.get('fragile'))})")
+    print(f"   host_mem_floor={floor}GB  budget={budget}  by={exp['dispatched_by']}")
+    print(f"   NOTE: enforce the host-RAM watchdog on BOTH allocation AND teardown; use os._exit().")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -465,6 +501,11 @@ def main():
     ec.add_argument("--exp", required=True); ec.add_argument("--effect", required=True)
     ec.add_argument("--summary", required=True); ec.add_argument("--revival")
     ec.set_defaults(fn=cmd_exp_complete)
+    ed = esub.add_parser("dispatch")
+    ed.add_argument("--exp", required=True); ed.add_argument("--node", required=True)
+    ed.add_argument("--by", help="orchestrator id"); ed.add_argument("--approve", action="store_true")
+    ed.add_argument("--human-approved", dest="human_approved", action="store_true")
+    ed.set_defaults(fn=cmd_exp_dispatch)
     args = ap.parse_args(); args.fn(args)
 
 if __name__ == "__main__": main()

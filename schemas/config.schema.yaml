@@ -13,6 +13,26 @@ compute_nodes: []              # [{name, kind, gpu_type, gpu_count, host_mem_gb,
                                #   probe_cmd: shell cmd the orchestrator runs to check the node is alive
                                #   (e.g. "ssh <node> nvidia-smi --query-gpu=name --format=csv,noheader")
 session_agent_backends: []     # backends researchers can use (e.g. local codex/claude CLI) — config, not code
+# --- agent embodiment + resource pools ---
+agent_embodiment:
+  orchestrator: interactive    # new_session, human-in-the-loop, revivable via agent_run.message
+  researchers:  interactive    # new_session, human-in-the-loop; CPU workload only
+  committee:    autonomous     # headless CLI, spawn-for-review -> tear down; no human needed
+resource_pools:
+  cpu_agent_pool:              # orchestrator + researchers + committee CLI calls. NEVER touches GPU.
+    budget: {max_concurrent_sessions: 0, token_aware: true}
+  gpu_pool:                    # the actual experiments. ONLY the orchestrator dispatches here.
+    dispatch: orchestrator_only   # INVARIANT 3
+# --- agent embodiment + resource pools ---
+agent_embodiment:
+  orchestrator: interactive    # new_session, human-in-the-loop, revivable via agent_run.message
+  researchers:  interactive    # new_session, human-in-the-loop; CPU workload only
+  committee:    autonomous     # headless CLI, spawn-for-review -> tear down; no human needed
+resource_pools:
+  cpu_agent_pool:              # orchestrator + researchers + committee CLI calls. NEVER touches GPU.
+    budget: {max_concurrent_sessions: 0, token_aware: true}
+  gpu_pool:                    # the actual experiments. ONLY the orchestrator dispatches here.
+    dispatch: orchestrator_only   # INVARIANT 3
 committee:                     # logical-standing, physically-on-demand
   rubric_version: v001
   members:                     # role -> backend (backend is config!)

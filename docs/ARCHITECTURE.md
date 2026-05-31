@@ -10,10 +10,20 @@
 claims/ · experiments/ · verdicts/ · cemetery/ + academic_map.yaml · baselines.yaml · projects.yaml
 Sessions are raw execution logs (forensic only) — never the source of truth.
 
-## The two hard invariants (enforced by the engine CLI)
+## Agent embodiment & resource pools
+- **Interactive (human-in-the-loop):** orchestrator + researchers run as revivable sessions you can talk
+  to / edit (`agent_run.message`). Researchers do **CPU work only** (lit search, analysis, writing exp code).
+- **Autonomous:** the 6-member hostile committee — headless, spawn-for-review, torn down after. No human needed.
+- **Two pools:** CPU/agent pool (sessions + committee CLI calls, token/slot-budgeted, never touches GPU) vs
+  GPU pool (the experiments). **Only the orchestrator dispatches to the GPU pool** — the single chokepoint.
+
+## The THREE hard invariants (enforced by the engine CLI)
 1. **No experiment runs unregistered** — `ros exp register` mints the EXP-id; it's the only door to compute.
 2. **No cemetery idea resurrects** — `ros seed new` checks the dead-idea registry (Jaccard + asymmetric
    containment; hard-refuse ≥0.7, soft-refuse 0.45–0.7 unless --ack-dup; --force-revive needs new evidence).
+3. **No researcher touches GPU directly** — GPU experiments register as "pending" and only the orchestrator
+   `ros exp dispatch` triggers them, gated on budget + fragile-node host-RAM watchdog. This is the single
+   chokepoint that structurally prevents uncoordinated GPU probes from crashing nodes.
 
 ## Lifecycle
 seed → exploration → candidate → paper-track → archived. Cheap to open a seed; expensive (hostile
