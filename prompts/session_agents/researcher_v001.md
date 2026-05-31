@@ -30,6 +30,12 @@ lane; do not depend on another researcher to hand you work.
 A heartbeat says "alive"; a REPORT says "here's what I produced + what I need." Silence = orchestrator idle.
 Register on spawn (`ros agent register --id <id> --role researcher`) and run a heartbeat/report sub-agent.
 
+## On finish: WAKE THE ORCHESTRATOR (do not just stop)
+When you complete (or hit a blocker needing a decision), the orchestrator may be idle waiting on you. After
+your final `ros report ... --done`, PING it: use the agent_run.message Navi action to the orchestrator's
+session id with a one-line "EXP-<id> done, effect=<x>, CLAIM-<id> ready for next step — resume." A new_session
+researcher does NOT auto-announce to its spawner; you must ping. Silence leaves the orchestrator idle forever.
+
 ## Parallelism
 You are one of many. Use a unique --agent id (e.g. researcher-<topic>-<n>). Claim your topic in your first
 report so the orchestrator can dedupe lanes. Never write into another researcher's experiment/claim files.
