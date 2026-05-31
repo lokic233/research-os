@@ -25,11 +25,38 @@ def reg_dir(root, *p): return os.path.join(root, "registry", *p)
 
 def load_yaml(path, default=None):
     if not os.path.exists(path): return default
-    with open(path) as f: return YAML.safe_load(f) or default
+    # BUG-10 fix: parse-tolerant — a torn/corrupt file must not crash callers (e.g. ros report).
+    try:
+        with open(path) as f: return YAML.safe_load(f) or default
+    except Exception:
+        # salvage: keep only lines up to the first parse break (drops stray trailing bytes / dup keys)
+        try:
+            txt = open(path, errors="ignore").read()
+            for cut in range(len(txt), 0, -1):
+                try:
+                    v = YAML.safe_load(txt[:cut])
+                    if isinstance(v, (dict, list)): return v
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return default if default is not None else {}
 
 def dump_yaml(path, obj):
+    # BUG-10 fix: ATOMIC write (tmp + os.replace) so concurrent heartbeat/report can't tear the file.
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f: YAML.safe_dump(obj, f, sort_keys=False, default_flow_style=False)
+    import tempfile
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp_", suffix=".yaml")
+    try:
+        with os.fdopen(fd, "w") as f:
+            YAML.safe_dump(obj, f, sort_keys=False, default_flow_style=False)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)   # atomic on POSIX
+    except Exception:
+        try: os.remove(tmp)
+        except OSError: pass
+        raise
 
 def find_obj(root, kind, oid):
     """Find OID.yaml anywhere under registry/<kind>/ (now nested PROJ-x/<date>/). Returns path or None."""
@@ -323,10 +350,13 @@ def cmd_agent_register(args):
 def cmd_heartbeat(args):
     root = inst_root(args); rd = runtime_dir(root)
     p = os.path.join(rd, "agents", f"{args.agent}.yaml")
-    rec = load_yaml(p)
-    if not rec:
-        # tolerate heartbeat-before-register (auto-create minimal)
-        rec = {"agent_id": args.agent, "role": args.role or "unknown", "spawned_at": NOW(), "heartbeat_count": 0}
+    rec = load_yaml(p) or {}
+    if not rec.get("agent_id"):
+        # tolerate heartbeat-before-register (auto-create minimal); keep any role we have
+        rec.setdefault("agent_id", args.agent); rec.setdefault("spawned_at", NOW()); rec.setdefault("heartbeat_count", 0)
+    # BUG-10 fix: never downgrade an existing role to 'unknown'; only set from --role or keep prior
+    if args.role: rec["role"] = args.role
+    elif not rec.get("role"): rec["role"] = "unknown"
     rec["last_heartbeat"] = NOW()
     rec["heartbeat_count"] = int(rec.get("heartbeat_count", 0)) + 1
     if args.status: rec["status"] = args.status
