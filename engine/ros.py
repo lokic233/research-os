@@ -564,6 +564,16 @@ def cmd_verdict_write(args):
                      f"got {len(parsed)}. (use --override-rule only with explicit justification.)")
         if rule=="unanimous" and any(v!="green" for v in vals):
             sys.exit(f"❌ green_rule=unanimous: every vote must be green for a {args.final} verdict; got {vals}.")
+    # BUG-18 fix: idempotency — if an identical verdict (same claim+experiments+final) already exists,
+    # do NOT create a duplicate (guards against harness/transport retries of the same tool call).
+    if not getattr(args, "allow_dup", False):
+        for vf in glob.glob(reg_dir(root,"verdicts","**","VERDICT-*.yaml"),recursive=True):
+            ev=load_yaml(vf,{}) or {}
+            if (ev.get("claim_id")==args.claim and ev.get("final_verdict")==args.final
+                    and sorted(ev.get("experiment_ids") or [])==sorted(exp_ids)):
+                print(f"↩︎ idempotent: {ev.get('verdict_id')} already records {args.final} for {args.claim} "
+                      f"citing {exp_ids} — not creating a duplicate. (use --allow-dup to force.)")
+                return
     vid=next_id(root,"verdicts","VERDICT")
     import datetime as _d
     date=args.date or _d.datetime.now(_d.timezone.utc).strftime("%Y-%m-%d")
@@ -660,6 +670,7 @@ def main():
     vwr.add_argument("--required",help="required_evidence to advance, ';'-separated")
     vwr.add_argument("--map-delta",dest="map_delta",help="academic-map delta proposals, ';'-separated")
     vwr.add_argument("--baselines",help="baseline_requirements, ';'-separated")
+    vwr.add_argument("--allow-dup",dest="allow_dup",action="store_true",help="bypass idempotency dedup (force a duplicate verdict)")
     vwr.set_defaults(fn=cmd_verdict_write)
     # env discovery
     ev = sub.add_parser("env"); evs = ev.add_subparsers(dest="sub", required=True)
