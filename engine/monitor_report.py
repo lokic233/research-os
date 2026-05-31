@@ -40,7 +40,7 @@ def state(a_):
 roster=[]
 for ag in agents:
     st,am=state(ag); roster.append((ag.get("agent_id","?"),ag.get("role","?"),ag.get("status","?"),am,st,ag.get("note","")))
-researchers=[r for r in roster if "researcher" in r[0] or r[1] in ("literature_miner","experiment_runner","synthesis_agent","prior_art_scout","implementation_agent","benchmark_agent")]
+researchers=[r for r in roster if r[1]=="researcher" or "researcher" in r[0]]
 committee=[r for r in roster if "committee" in r[0] or r[1] in ("novelty_killer","systems_reviewer","evaluation_prosecutor","theory_skeptic","product_realist","area_chair")]
 dead=[r for r in roster if r[4]=="DEAD"]; stale=[r for r in roster if r[4]=="stale"]
 
@@ -82,7 +82,7 @@ for fn in glob.glob(os.path.join(rd,"reports","*.jsonl")):
 silent_researchers=[]
 for ag in agents:
     aid=ag.get("agent_id",""); role=ag.get("role","")
-    if "committee" in aid or role in ("novelty_killer","systems_reviewer","evaluation_prosecutor","theory_skeptic","product_realist","area_chair","orchestrator"): continue
+    if not (role=="researcher" or "researcher" in aid): continue
     lr=ag.get("last_report_ts") or ag.get("last_heartbeat","")
     am=age_min(lr)
     if am is None or am>W: silent_researchers.append((aid,role,am))

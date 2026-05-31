@@ -516,8 +516,8 @@ def cmd_reports_age(args):
     for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
         a = load_yaml(fn, {}) or {}
         role = a.get("role","")
-        if "committee" in (a.get("agent_id","")) or role in ("novelty_killer","systems_reviewer","evaluation_prosecutor","theory_skeptic","product_realist","area_chair","orchestrator"):
-            continue  # researchers only
+        if not (role=="researcher" or "researcher" in a.get("agent_id","")):
+            continue  # researchers only (unified role)
         lr = a.get("last_report_ts") or a.get("last_heartbeat","")
         try:
             age = (now - _dt.datetime.strptime(lr,"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)).total_seconds()/60

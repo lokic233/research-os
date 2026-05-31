@@ -21,6 +21,16 @@
 - [x] Orchestrator OWNS committee lifecycle (spawn/heartbeat/revive via agent+liveness commands)
 - [x] Heartbeat sub-agent pattern (prompts/_shared/HEARTBEAT_v001.md) — cheap process kicks while main agent is busy
 
+## Done (added)
+- [x] Progress-report channel (ros report/inbox/reports-age) — fixes the idle-orchestrator bug
+- [x] Unified `researcher` role: literature/skeptic/experiment/synthesis are SKILLS (session_agents/skills/),
+      one full-capability researcher owns the whole loop; N spawn in PARALLEL (validated: 3 parallel lanes + inbox)
+
+## Done (added)
+- [x] Progress-report channel (ros report/inbox/reports-age) — fixes the idle-orchestrator bug
+- [x] Unified `researcher` role: literature/skeptic/experiment/synthesis are SKILLS (session_agents/skills/),
+      one full-capability researcher owns the whole loop; N spawn in PARALLEL (validated: 3 parallel lanes + inbox)
+
 ## Next (in priority order)
 1. `ros init` in the real instance (lokic233/autonomous-research) + research-os.config.yaml
 2. Migrate the 3 existing GREEN theses + dead ideas as seed claims + cemetery entries

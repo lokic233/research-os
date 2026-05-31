@@ -16,21 +16,21 @@ session_agent_backends: []     # backends researchers can use (e.g. local codex/
 # --- agent embodiment + resource pools ---
 agent_embodiment:
   orchestrator: interactive    # new_session, human-in-the-loop, revivable via agent_run.message
-  researchers:  interactive    # new_session, human-in-the-loop; CPU workload only
+  researchers:  interactive    # N parallel unified 'researcher' sessions; each owns a full loop; CPU-only
   committee:    autonomous     # headless CLI, spawn-for-review -> tear down; no human needed
 resource_pools:
   cpu_agent_pool:              # orchestrator + researchers + committee CLI calls. NEVER touches GPU.
-    budget: {max_concurrent_sessions: 0, token_aware: true}
+    budget: {max_concurrent_sessions: 0, max_parallel_researchers: 0, token_aware: true}
   gpu_pool:                    # the actual experiments. ONLY the orchestrator dispatches here.
     dispatch: orchestrator_only   # INVARIANT 3
 # --- agent embodiment + resource pools ---
 agent_embodiment:
   orchestrator: interactive    # new_session, human-in-the-loop, revivable via agent_run.message
-  researchers:  interactive    # new_session, human-in-the-loop; CPU workload only
+  researchers:  interactive    # N parallel unified 'researcher' sessions; each owns a full loop; CPU-only
   committee:    autonomous     # headless CLI, spawn-for-review -> tear down; no human needed
 resource_pools:
   cpu_agent_pool:              # orchestrator + researchers + committee CLI calls. NEVER touches GPU.
-    budget: {max_concurrent_sessions: 0, token_aware: true}
+    budget: {max_concurrent_sessions: 0, max_parallel_researchers: 0, token_aware: true}
   gpu_pool:                    # the actual experiments. ONLY the orchestrator dispatches here.
     dispatch: orchestrator_only   # INVARIANT 3
 committee:                     # logical-standing, physically-on-demand
