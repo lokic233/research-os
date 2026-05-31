@@ -9,6 +9,18 @@
 - [x] All 6 object schemas + config schema
 - [x] Orchestrator v001 + Orchestrator-Monitor v001 prompts
 
+## Done (added — orchestrator capabilities)
+- [x] `ros env discover [--probe]` — capability discovery: backends, nodes, GPU/mem envelope, fragile flags
+- [x] `ros agent register` / `ros heartbeat` / `ros liveness` — push-based, PATIENT (alive/stale/DEAD by grace)
+- [x] Orchestrator OWNS committee lifecycle (spawn/heartbeat/revive via agent+liveness commands)
+- [x] Heartbeat sub-agent pattern (prompts/_shared/HEARTBEAT_v001.md) — cheap process kicks while main agent is busy
+
+## Done (added — orchestrator capabilities)
+- [x] `ros env discover [--probe]` — capability discovery: backends, nodes, GPU/mem envelope, fragile flags
+- [x] `ros agent register` / `ros heartbeat` / `ros liveness` — push-based, PATIENT (alive/stale/DEAD by grace)
+- [x] Orchestrator OWNS committee lifecycle (spawn/heartbeat/revive via agent+liveness commands)
+- [x] Heartbeat sub-agent pattern (prompts/_shared/HEARTBEAT_v001.md) — cheap process kicks while main agent is busy
+
 ## Next (in priority order)
 1. `ros init` in the real instance (lokic233/autonomous-research) + research-os.config.yaml
 2. Migrate the 3 existing GREEN theses + dead ideas as seed claims + cemetery entries

@@ -9,7 +9,10 @@ instance:
 runtime:
   control_node: ""             # stable node hosting runtime/ (e.g. a laptop) — NOT a GPU node
   runtime_dir: ""              # abs path to runtime/ on the control node
-compute_nodes: []              # [{name, kind, gpu_type, host_mem_gb, notes, fragile: true/false}]
+compute_nodes: []              # [{name, kind, gpu_type, gpu_count, host_mem_gb, fragile, probe_cmd}]
+                               #   probe_cmd: shell cmd the orchestrator runs to check the node is alive
+                               #   (e.g. "ssh <node> nvidia-smi --query-gpu=name --format=csv,noheader")
+session_agent_backends: []     # backends researchers can use (e.g. local codex/claude CLI) — config, not code
 committee:                     # logical-standing, physically-on-demand
   rubric_version: v001
   members:                     # role -> backend (backend is config!)
