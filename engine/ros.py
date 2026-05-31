@@ -620,9 +620,31 @@ def cmd_gpu_poll(args):
     if q["leases"].get(args.node):
         print(f"{args.node} BUSY (lease {q['leases'][args.node]}); no pull."); return
     # probe node free (config probe_cmd must succeed)
+    # BUG-26 fix: probe_cmd is a heartbeat-file freshness check; nothing refreshes that file when the node is
+    # idle, so it goes stale (>15m) and a healthy free node is wrongly declared unreachable, stalling the pull
+    # scheduler. When probe_cmd fails, fall back to the live _old_probe (ssh nvidia-smi/rocminfo) before giving
+    # up; if the live probe succeeds, refresh the heartbeat file so subsequent ticks pass cleanly.
     if node.get("probe_cmd"):
         r=subprocess.run(node["probe_cmd"],shell=True,capture_output=True,text=True,timeout=30)
-        if r.returncode!=0: print(f"{args.node} unreachable (probe failed); no pull."); return
+        if r.returncode!=0:
+            live=node.get("_old_probe")
+            ok=False
+            if live:
+                try:
+                    r2=subprocess.run(live,shell=True,capture_output=True,text=True,timeout=30)
+                    ok=(r2.returncode==0)
+                except Exception:
+                    ok=False
+            if not ok:
+                print(f"{args.node} unreachable (heartbeat stale AND live probe failed); no pull."); return
+            # live probe confirms node alive -> refresh stale heartbeat so the scheduler unblocks
+            try:
+                hb=os.path.join(root,"runtime","gpu_heartbeat",args.node)
+                os.makedirs(os.path.dirname(hb),exist_ok=True)
+                with open(hb,"a"): os.utime(hb,None)
+                print(f"   (heartbeat for {args.node} was stale; live probe OK, refreshed heartbeat)")
+            except Exception as _e:
+                print(f"   (warn: live probe OK but could not refresh heartbeat: {str(_e)[:120]})")
     # pick next queued exp matching this node's gpu_type (or 'any'), highest priority, watchdog-safe on fragile
     cand=None
     for i in sorted(q["queue"],key=lambda x:-x.get("priority",0)):
