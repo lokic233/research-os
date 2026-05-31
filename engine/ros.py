@@ -211,12 +211,11 @@ def cmd_status(args):
 
 def cmd_init(args):
     root = inst_root(args)
-    for d in ["registry/claims","registry/experiments","registry/verdicts","registry/cemetery",
+    for d in ["registry/claims","registry/verdicts","registry/cemetery",
               "experiments","prior_art","sessions","learning","projects"]:
         os.makedirs(os.path.join(root,d), exist_ok=True)
         open(os.path.join(root,d,".gitkeep"),"a").close()
-    for f,seed in [("registry/academic_map.yaml",{"nodes":[]}),("registry/baselines.yaml",{"families":[]}),
-                   ("registry/projects.yaml",{"projects":[]})]:
+    for f,seed in [("registry/academic_map.yaml",{"nodes":[]}),("registry/baselines.yaml",{"families":[]})]:
         p=os.path.join(root,f)
         if not os.path.exists(p): dump_yaml(p, seed)
     print(f"✅ initialized research-os instance at {root}")
@@ -553,12 +552,31 @@ def cmd_reports_age(args):
         print(f"✅ all researchers reported within {win}m")
 
 
+def cmd_projects(args):
+    root=inst_root(args)
+    pdir=os.path.join(root,"projects")
+    found=sorted(glob.glob(os.path.join(pdir,"PROJ-*")))
+    if not found: print("(no projects — create projects/<PROJ-id>/project_overview.md)"); return
+    print(f"projects ({len(found)}):")
+    for d in found:
+        pid=os.path.basename(d)
+        ov=os.path.join(d,"project_overview.md")
+        title=""
+        if os.path.exists(ov):
+            for ln in open(ov):
+                if ln.startswith("# "): title=ln[2:].strip(); break
+        reports=sorted(glob.glob(os.path.join(d,"*","progress_report.md")))
+        last=os.path.basename(os.path.dirname(reports[-1])) if reports else "no report"
+        print(f"  {pid}: {title}  (latest progress: {last})")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init").set_defaults(fn=cmd_init)
     sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("projects").set_defaults(fn=cmd_projects)
     # env discovery
     ev = sub.add_parser("env"); evs = ev.add_subparsers(dest="sub", required=True)
     evd = evs.add_parser("discover"); evd.add_argument("--probe", action="store_true", help="run config probe_cmd per node")
