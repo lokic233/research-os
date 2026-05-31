@@ -128,13 +128,21 @@ def cmd_exp_register(args):
         if not cf:
             sys.exit(f"❌ claim {args.claim} not found. Register the claim/seed first.")
     eid = next_id(root, "experiments", "EXP")
+    # BUG-5 fix: inherit project_id from the claim (not PROJ-0000 placeholder)
+    proj = args.project
+    if not proj and args.claim and args.claim != "none":
+        _claim = load_yaml(find_obj(root, "claims", args.claim))
+        if _claim: proj = _claim.get("project_id")
+    proj = proj or "PROJ-0000"
+    # BUG-5 fix: needs_gpu is explicit (--gpu) OR a positive gpu-hours budget; CPU/level-0 default = no GPU
+    needs_gpu = bool(getattr(args, "gpu", False)) or (args.max_gpu_hours or 0) > 0
     obj = {
-        "exp_id": eid, "project_id": args.project or "PROJ-0000",
+        "exp_id": eid, "project_id": proj,
         "claim_id": (None if args.claim=="none" else args.claim),
-        "session_id": args.session or "", "level": args.level, "hardware": args.hardware or "",
+        "session_id": args.session or "", "level": args.level, "hardware": args.hardware or ("cpu" if not needs_gpu else ""),
         "resource_budget": {"max_wall_clock_minutes": args.max_minutes, "max_gpu_hours": args.max_gpu_hours,
                             "max_memory_gb": args.max_mem_gb, "host_mem_floor_gb": args.host_mem_floor},
-        "needs_gpu": (args.max_gpu_hours or 0) > 0, "dispatched_by": "", "node_lease": "",
+        "needs_gpu": needs_gpu, "dispatched_by": "", "node_lease": "",
         "status": "pending", "result_summary": "", "result_effect": "",
         "artifacts_path": "", "reproducibility": "", "linked_verdicts": [],
         "started_at": "", "completed_at": "", "prompt_version": args.prompt_version or "",
@@ -223,108 +231,11 @@ def cmd_init(args):
 
 
 # ============================ runtime: env / agents / liveness ============================
-def runtime_dir(root):
-    cfg = load_yaml(os.path.join(root, "research-os.config.yaml"), {}) or {}
-    rd = (cfg.get("runtime") or {}).get("runtime_dir")
-    return os.path.abspath(rd) if rd else os.path.join(root, "runtime")
 
-def _cfg(root):
-    return load_yaml(os.path.join(root, "research-os.config.yaml"), {}) or {}
 
-def cmd_env_discover(args):
-    """Capability discovery: structure config into a capability inventory; optionally probe live.
-    Generic — probe commands come from config, not hardcoded. Writes runtime/orchestrator/capabilities.yaml."""
-    root = inst_root(args); cfg = _cfg(root)
-    rd = runtime_dir(root); os.makedirs(os.path.join(rd, "orchestrator"), exist_ok=True)
-    backends = {}
-    for m in (cfg.get("committee") or {}).get("members", []):
-        if m.get("backend"): backends[m["backend"]] = {"roles": [m["role"]], "status": "declared"}
-    for b in (cfg.get("session_agent_backends") or []):
-        backends.setdefault(b, {"roles": [], "status": "declared"})
-    nodes = []
-    total_gpu = 0; total_mem = 0
-    for n in (cfg.get("compute_nodes") or []):
-        rec = dict(n); rec.setdefault("status", "declared")
-        if args.probe and n.get("probe_cmd"):
-            import subprocess
-            try:
-                out = subprocess.run(n["probe_cmd"], shell=True, capture_output=True, text=True, timeout=30)
-                rec["status"] = "alive" if out.returncode == 0 else "unreachable"
-                rec["probe_out"] = (out.stdout or out.stderr)[-300:]
-            except Exception as e:
-                rec["status"] = "unreachable"; rec["probe_out"] = str(e)[:200]
-        nodes.append(rec)
-        total_gpu += int(n.get("gpu_count", 0) or 0); total_mem += int(n.get("host_mem_gb", 0) or 0)
-    cap = {
-        "discovered_at": NOW(),
-        "control_node": (cfg.get("runtime") or {}).get("control_node", ""),
-        "backends": backends,
-        "compute_nodes": nodes,
-        "resource_envelope": {"total_gpus": total_gpu, "total_host_mem_gb": total_mem,
-                              "manageable_levels": list((cfg.get("budgets") or {}).keys())},
-        "budgets": cfg.get("budgets", {}),
-        "liveness": cfg.get("liveness", {}),
-        "safety": cfg.get("safety", {}),
-    }
-    p = os.path.join(rd, "orchestrator", "capabilities.yaml"); dump_yaml(p, cap)
-    print(f"✅ env discovered -> {os.path.relpath(p, root)}")
-    print(f"   backends: {len(backends)} ({', '.join(backends) or 'none — set in config'})")
-    print(f"   nodes: {len(nodes)}  envelope: {cap['resource_envelope']['total_gpus']} GPU, "
-          f"{cap['resource_envelope']['total_host_mem_gb']} GB host RAM")
-    if args.probe: 
-        for n in nodes: print(f"     - {n.get('name','?')}: {n.get('status')}")
 
-def cmd_agent_register(args):
-    root = inst_root(args); rd = runtime_dir(root)
-    d = os.path.join(rd, "agents"); os.makedirs(d, exist_ok=True)
-    rec = {"agent_id": args.id, "role": args.role, "backend": args.backend or "",
-           "node": args.node or "", "status": "running", "spawned_at": NOW(),
-           "last_heartbeat": NOW(), "current_claim_id": args.claim or "", "current_exp_id": args.exp or "",
-           "note": "", "heartbeat_count": 0}
-    dump_yaml(os.path.join(d, f"{args.id}.yaml"), rec)
-    print(f"✅ agent {args.id} registered (role={args.role}). Heartbeat: `ros heartbeat --agent {args.id}` every ~{(_cfg(root).get('liveness') or {}).get('kick_interval_minutes',15)}m")
 
-def cmd_heartbeat(args):
-    root = inst_root(args); rd = runtime_dir(root)
-    p = os.path.join(rd, "agents", f"{args.agent}.yaml")
-    rec = load_yaml(p)
-    if not rec:
-        # tolerate heartbeat-before-register (auto-create minimal)
-        rec = {"agent_id": args.agent, "role": args.role or "unknown", "spawned_at": NOW(), "heartbeat_count": 0}
-    rec["last_heartbeat"] = NOW()
-    rec["heartbeat_count"] = int(rec.get("heartbeat_count", 0)) + 1
-    if args.status: rec["status"] = args.status
-    if args.note: rec["note"] = args.note
-    if args.claim: rec["current_claim_id"] = args.claim
-    if args.exp: rec["current_exp_id"] = args.exp
-    dump_yaml(p, rec)
-    print(f"💓 {args.agent} heartbeat #{rec['heartbeat_count']} ({rec.get('status','?')})")
 
-def cmd_liveness(args):
-    """Patient liveness report. alive = kicked within kick_interval; stale = within grace; dead = past grace.
-    The orchestrator/monitor reads this. NEVER declares dead before the grace window."""
-    root = inst_root(args); rd = runtime_dir(root); cfg = _cfg(root)
-    liv = cfg.get("liveness", {}) or {}
-    kick = int(liv.get("kick_interval_minutes", 15)); grace = int(liv.get("patient_grace_minutes", 45))
-    import datetime as _dt
-    now = _dt.datetime.now(_dt.timezone.utc)
-    rows = []
-    for fn in sorted(glob.glob(os.path.join(rd, "agents", "*.yaml"))):
-        a = load_yaml(fn, {})
-        try:
-            last = _dt.datetime.strptime(a.get("last_heartbeat",""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
-            age = (now - last).total_seconds() / 60.0
-        except Exception:
-            age = 1e9
-        state = "alive" if age <= kick*1.5 else ("stale" if age <= grace else "DEAD")
-        rows.append((a.get("agent_id","?"), a.get("role","?"), a.get("status","?"), round(age,1), state))
-    if not rows: print("(no agents registered)"); return
-    print(f"liveness (kick={kick}m, patient grace={grace}m):")
-    for aid, role, st, age, state in rows:
-        mark = {"alive":"💓","stale":"⏳","DEAD":"☠️"}[state]
-        print(f"  {mark} {aid:24} {role:20} {st:10} last={age}m -> {state}")
-    dead = [r[0] for r in rows if r[4]=="DEAD"]
-    if dead: print(f"  ⚠️ DEAD (past {grace}m grace — orchestrator should revive): {', '.join(dead)}")
 
 
 
@@ -422,15 +333,19 @@ def cmd_liveness(args):
             age = (now - last).total_seconds() / 60.0
         except Exception:
             age = 1e9
-        state = "alive" if age <= kick*1.5 else ("stale" if age <= grace else "DEAD")
+        # BUG-7 fix: terminal states (completed/failed) are RETIRED — never flagged for revival
+        if a.get("status") in ("completed","failed","retired"):
+            state = "retired"
+        else:
+            state = "alive" if age <= kick*1.5 else ("stale" if age <= grace else "DEAD")
         rows.append((a.get("agent_id","?"), a.get("role","?"), a.get("status","?"), round(age,1), state))
     if not rows: print("(no agents registered)"); return
     print(f"liveness (kick={kick}m, patient grace={grace}m):")
     for aid, role, st, age, state in rows:
-        mark = {"alive":"💓","stale":"⏳","DEAD":"☠️"}[state]
+        mark = {"alive":"💓","stale":"⏳","DEAD":"☠️","retired":"🏁"}[state]
         print(f"  {mark} {aid:24} {role:20} {st:10} last={age}m -> {state}")
     dead = [r[0] for r in rows if r[4]=="DEAD"]
-    if dead: print(f"  ⚠️ DEAD (past {grace}m grace — orchestrator should revive): {', '.join(dead)}")
+    if dead: print(f"  ⚠️ DEAD (past {grace}m grace, NOT retired — orchestrator should revive): {', '.join(dead)}")
 
 
 
@@ -572,6 +487,7 @@ def cmd_projects(args):
 
 def cmd_verdict_write(args):
     """Write a committee VERDICT into verdicts/<PROJ>/<date>/, REQUIRING linked experiment ids that exist.
+    Enforces config green_rule (BUG-3 fix): green/promote require full committee parity.
     Back-links the verdict into the claim's verdict_history + each experiment's linked_verdicts."""
     root=inst_root(args)
     cf=find_obj(root,"claims",args.claim)
@@ -586,14 +502,26 @@ def cmd_verdict_write(args):
         hits=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)
         if not hits: sys.exit(f"❌ experiment {eid} not found under experiments/ — cannot file a verdict citing it.")
         exp_paths.append(os.path.relpath(os.path.dirname(hits[0]),root))
+    votes=[v.strip() for v in (args.votes or "").split(",") if v.strip()]  # role:vote pairs
+    parsed=[dict(zip(["role","vote"],v.split(":",1))) for v in votes]
+    # BUG-3 FIX: enforce committee green_rule for green/promote verdicts
+    cfg=_cfg(root); comm=cfg.get("committee",{}) or {}
+    members=comm.get("members",[]) or []; rule=comm.get("green_rule","unanimous")
+    if args.final in ("green","promote") and not args.override_rule:
+        nmembers=len(members) or 6
+        vals=[ (p.get("vote") or "").lower() for p in parsed ]
+        if len(parsed) < nmembers:
+            sys.exit(f"❌ green_rule={rule}: {args.final} needs all {nmembers} committee votes via --votes; "
+                     f"got {len(parsed)}. (use --override-rule only with explicit justification.)")
+        if rule=="unanimous" and any(v!="green" for v in vals):
+            sys.exit(f"❌ green_rule=unanimous: every vote must be green for a {args.final} verdict; got {vals}.")
     vid=next_id(root,"verdicts","VERDICT")
     import datetime as _d
     date=args.date or _d.datetime.now(_d.timezone.utc).strftime("%Y-%m-%d")
-    votes=[v.strip() for v in (args.votes or "").split(",") if v.strip()]  # role:vote pairs
     obj={"verdict_id":vid,"claim_id":args.claim,"project_id":pid,"date":date,
          "experiment_ids":exp_ids,"experiment_paths":exp_paths,
-         "committee_version":args.committee_version or "v001","prompt_versions":{},
-         "reviewer_votes":[dict(zip(["role","vote"],v.split(":",1))) for v in votes],
+         "committee_version":args.committee_version or comm.get("rubric_version","v001"),"prompt_versions":{},
+         "reviewer_votes":parsed,"green_rule":rule,
          "final_verdict":args.final,"fatal_objections":[],"required_evidence":[],
          "map_delta_proposals":[],"baseline_requirements":[],"created_at":NOW()}
     d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
@@ -604,44 +532,7 @@ def cmd_verdict_write(args):
         ep=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)[0]
         e=load_yaml(ep); e.setdefault("linked_verdicts",[]).append(vid); dump_yaml(ep,e)
     print(f"✅ {vid} ({args.final}) -> {os.path.relpath(path,root)}")
-    print(f"   cites experiments: {', '.join(exp_ids)}  | claim {args.claim} verdict_history updated")
-
-
-def cmd_verdict_write(args):
-    """Write a committee VERDICT into verdicts/<PROJ>/<date>/, REQUIRING linked experiment ids that exist.
-    Back-links the verdict into the claim's verdict_history + each experiment's linked_verdicts."""
-    root=inst_root(args)
-    cf=find_obj(root,"claims",args.claim)
-    if not cf: sys.exit(f"❌ claim {args.claim} not found.")
-    claim=load_yaml(cf); pid=claim.get("project_id","PROJ-0000")
-    # validate experiment links (must exist under experiments/**/<EXP>/)
-    exp_ids=[e.strip() for e in (args.experiments or "").split(",") if e.strip()]
-    if not exp_ids:
-        sys.exit("❌ a verdict MUST cite the experiment(s) that informed it: --experiments EXP-xxxx[,EXP-yyyy]")
-    exp_paths=[]
-    for eid in exp_ids:
-        hits=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)
-        if not hits: sys.exit(f"❌ experiment {eid} not found under experiments/ — cannot file a verdict citing it.")
-        exp_paths.append(os.path.relpath(os.path.dirname(hits[0]),root))
-    vid=next_id(root,"verdicts","VERDICT")
-    import datetime as _d
-    date=args.date or _d.datetime.now(_d.timezone.utc).strftime("%Y-%m-%d")
-    votes=[v.strip() for v in (args.votes or "").split(",") if v.strip()]  # role:vote pairs
-    obj={"verdict_id":vid,"claim_id":args.claim,"project_id":pid,"date":date,
-         "experiment_ids":exp_ids,"experiment_paths":exp_paths,
-         "committee_version":args.committee_version or "v001","prompt_versions":{},
-         "reviewer_votes":[dict(zip(["role","vote"],v.split(":",1))) for v in votes],
-         "final_verdict":args.final,"fatal_objections":[],"required_evidence":[],
-         "map_delta_proposals":[],"baseline_requirements":[],"created_at":NOW()}
-    d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
-    # back-link claim + experiments
-    claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final})
-    claim["last_updated"]=NOW(); dump_yaml(cf,claim)
-    for eid in exp_ids:
-        ep=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)[0]
-        e=load_yaml(ep); e.setdefault("linked_verdicts",[]).append(vid); dump_yaml(ep,e)
-    print(f"✅ {vid} ({args.final}) -> {os.path.relpath(path,root)}")
-    print(f"   cites experiments: {', '.join(exp_ids)}  | claim {args.claim} verdict_history updated")
+    print(f"   votes: {len(parsed)}/{len(members) or 6}  cites: {', '.join(exp_ids)}  | claim {args.claim} updated")
 
 
 def main():
@@ -657,42 +548,8 @@ def main():
     vwr.add_argument("--experiments",required=True,help="REQUIRED EXP-xxxx[,EXP-yyyy] that informed the verdict")
     vwr.add_argument("--votes",help="role:vote comma list, e.g. novelty_killer:yellow,area_chair:yellow")
     vwr.add_argument("--committee-version",dest="committee_version"); vwr.add_argument("--date")
+    vwr.add_argument("--override-rule",dest="override_rule",action="store_true",help="bypass green_rule vote-count check (needs justification)")
     vwr.set_defaults(fn=cmd_verdict_write)
-    vw=sub.add_parser("verdict"); vws=vw.add_subparsers(dest="sub",required=True)
-    vwr=vws.add_parser("write")
-    vwr.add_argument("--claim",required=True); vwr.add_argument("--final",required=True,help="green|yellow|red|kill|promote|needs-more-evidence")
-    vwr.add_argument("--experiments",required=True,help="REQUIRED EXP-xxxx[,EXP-yyyy] that informed the verdict")
-    vwr.add_argument("--votes",help="role:vote comma list, e.g. novelty_killer:yellow,area_chair:yellow")
-    vwr.add_argument("--committee-version",dest="committee_version"); vwr.add_argument("--date")
-    vwr.set_defaults(fn=cmd_verdict_write)
-    # env discovery
-    ev = sub.add_parser("env"); evs = ev.add_subparsers(dest="sub", required=True)
-    evd = evs.add_parser("discover"); evd.add_argument("--probe", action="store_true", help="run config probe_cmd per node")
-    evd.set_defaults(fn=cmd_env_discover)
-    # agent registry + heartbeat + liveness
-    ag = sub.add_parser("agent"); ags = ag.add_subparsers(dest="sub", required=True)
-    agr = ags.add_parser("register")
-    agr.add_argument("--id", required=True); agr.add_argument("--role", required=True)
-    agr.add_argument("--backend"); agr.add_argument("--node"); agr.add_argument("--claim"); agr.add_argument("--exp")
-    agr.set_defaults(fn=cmd_agent_register)
-    hb = sub.add_parser("heartbeat")
-    hb.add_argument("--agent", required=True); hb.add_argument("--status"); hb.add_argument("--note")
-    hb.add_argument("--role"); hb.add_argument("--claim"); hb.add_argument("--exp")
-    hb.set_defaults(fn=cmd_heartbeat)
-    sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
-    rp = sub.add_parser("report")
-    rp.add_argument("--agent", required=True); rp.add_argument("--role")
-    rp.add_argument("--done"); rp.add_argument("--doing"); rp.add_argument("--blocked")
-    rp.add_argument("--need"); rp.add_argument("--next"); rp.add_argument("--claim"); rp.add_argument("--exp")
-    rp.add_argument("--ping-orchestrator", dest="ping_orchestrator", action="store_true")
-    rp.set_defaults(fn=cmd_report)
-    ib = sub.add_parser("inbox"); ibs = ib.add_subparsers(dest="sub")
-    ib.add_argument("--action-only", dest="action_only", action="store_true"); ib.set_defaults(fn=cmd_inbox)
-    iba = ibs.add_parser("ack"); iba.add_argument("--agent"); iba.add_argument("--all", action="store_true")
-    iba.add_argument("--answer"); iba.add_argument("--action-only", dest="action_only", action="store_true")
-    iba.set_defaults(fn=cmd_inbox_ack)
-    ra = sub.add_parser("reports-age"); ra.add_argument("--window-min", dest="window_min", type=int, default=10)
-    ra.set_defaults(fn=cmd_reports_age)
     # env discovery
     ev = sub.add_parser("env"); evs = ev.add_subparsers(dest="sub", required=True)
     evd = evs.add_parser("discover"); evd.add_argument("--probe", action="store_true", help="run config probe_cmd per node")
@@ -733,7 +590,8 @@ def main():
     er.add_argument("--level", type=int, default=0, choices=[0,1,2,3])
     er.add_argument("--project"); er.add_argument("--session"); er.add_argument("--hardware")
     er.add_argument("--max-minutes", dest="max_minutes", type=int, default=15)
-    er.add_argument("--max-gpu-hours", dest="max_gpu_hours", type=float, default=0.25)
+    er.add_argument("--max-gpu-hours", dest="max_gpu_hours", type=float, default=0.0)
+    er.add_argument("--gpu", action="store_true", help="this experiment needs GPU (else CPU-only by default)")
     er.add_argument("--max-mem-gb", dest="max_mem_gb", type=int, default=0)
     er.add_argument("--host-mem-floor", dest="host_mem_floor", type=int, default=0)
     er.add_argument("--prompt-version", dest="prompt_version")
