@@ -218,6 +218,13 @@ def cmd_exp_complete(args):
     if cid:
         cf = find_obj(root, "claims", cid); claim = load_yaml(cf) if cf else None
         if claim:
+            # BUG-25 GUARD: never let a stray experiment KILL/weaken a PROMOTED (6/6-GREEN) claim without
+            # explicit override. A promoted claim is near-immutable; a mis-bound exp must not erase a top result.
+            if args.effect in ("kill","weaken") and claim.get("status")=="promoted" and not args.force_demote:
+                sys.exit(f"❌ REFUSED: {cid} is PROMOTED (6/6 GREEN) — a '{args.effect}' experiment will not "
+                         f"auto-demote it. If this exp genuinely overturns a promoted result, re-run with "
+                         f"--force-demote (explicit) AND it should go through a fresh committee, not a lone exp. "
+                         f"(Likely cause: the experiment was mis-bound to {cid}; rebind it to the correct claim.)")
             entry = {"exp_id": args.exp, "summary": args.summary, "data_path": exp["artifacts_path"]}
             if args.effect in ("kill","weaken"): claim["negative_evidence"].append(entry)
             else: claim["supporting_evidence"].append(entry)
@@ -838,6 +845,8 @@ def main():
     ec = esub.add_parser("complete")
     ec.add_argument("--exp", required=True); ec.add_argument("--effect", required=True)
     ec.add_argument("--summary", required=True); ec.add_argument("--revival")
+    ec.add_argument("--commit", action="store_true", help="git-commit durable state after completing")
+    ec.add_argument("--force-demote", dest="force_demote", action="store_true", help="explicitly allow killing/weakening a PROMOTED claim (BUG-25 guard override)")
     ec.set_defaults(fn=cmd_exp_complete)
     eg = esub.add_parser("gc"); eg.add_argument("--apply", action="store_true", help="actually retire (default dry-run)")
     eg.add_argument("--stale-min", dest="stale_min", type=int, default=30, help="min age (min) before a pending exp is gc-eligible")
