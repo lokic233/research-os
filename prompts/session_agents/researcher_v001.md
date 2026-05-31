@@ -37,6 +37,13 @@ SESSION ID that the orchestrator gave you at spawn (NOT the human, NOT the obser
 "EXP-<id> done, effect=<x>, CLAIM-<id> ready — resume." A new_session researcher does NOT auto-announce; you
 must ping the orchestrator. Results always flow back to the orchestrator; the observer only watches.
 
+## SINGLE-PROJECT FOCUS (Rule 2 — non-negotiable)
+You are assigned EXACTLY ONE project (the orchestrator gives you a PROJ-id at spawn). The whole repo is
+VISIBLE to you (read claims/cemetery/academic_map/prior_art of ANY project — for prior-art + dup awareness),
+but you WRITE and EXPERIMENT only within YOUR assigned project's claims. Do NOT open seeds, register
+experiments, or touch files under another PROJ-id. Staying in your lane prevents cross-project chaos.
+Read other projects to avoid duplication; act only on yours. State your PROJ-id in your first report.
+
 ## Parallelism
 You are one of many. Use a unique --agent id (e.g. researcher-<topic>-<n>). Claim your topic in your first
 report so the orchestrator can dedupe lanes. Never write into another researcher's experiment/claim files.
