@@ -35,11 +35,26 @@ PY
 run_one(){ # role backend
   role="$1"; backend="$2"
   sysp="$(cat "$PROMPTS/${role}_v001.md" "$PROMPTS/_committee_common_v001.md" 2>/dev/null)"
+  # BUG-16: when running area_chair, feed it the 5 reviewers' finished vote outputs to aggregate.
+  reviewer_block=""
+  if [ "$role" = "area_chair" ]; then
+    reviewer_block="
+
+=== REVIEWER VOTES TO AGGREGATE (read these; do not re-review) ==="
+    for ro in "$OUT"/*.out; do
+      rn="$(basename "$ro" .out)"
+      [ "$rn" = "area_chair" ] && continue
+      reviewer_block="$reviewer_block
+
+--- $rn ---
+$(cat "$ro" 2>/dev/null)"
+    done
+  fi
   full="$sysp
 
 === REVIEW PACKET ===
 $(cat "$PACKET")
-=== END PACKET ===
+=== END PACKET ===$reviewer_block
 Output ONLY your structured vote block for role $role."
   case "$backend" in
     claude-*|opus*|sonnet*) claude --model "$backend" -p "$full" </dev/null >"$OUT/${role}.out" 2>"$OUT/${role}.err" ;;
@@ -53,11 +68,18 @@ Output ONLY your structured vote block for role $role."
   echo "  done: $role ($backend)"
 }
 
-# launch all members in parallel (read file line by line — Bash 3.2 safe)
+# BUG-16 fix: run the REVIEWERS in parallel first, then run area_chair LAST so it can actually
+# aggregate the finished reviewer .out files (it was racing them under all-parallel launch).
+CHAIR_ROLE="" CHAIR_BACKEND=""
 while read -r role backend; do
   [ -z "$role" ] && continue
+  if [ "$role" = "area_chair" ]; then CHAIR_ROLE="$role"; CHAIR_BACKEND="$backend"; continue; fi
   run_one "$role" "$backend" &
 done < "$MEMBERS_FILE"
-wait
+wait   # all reviewers done + .out files flushed
+if [ -n "$CHAIR_ROLE" ]; then
+  echo "  (reviewers done; running $CHAIR_ROLE to aggregate)"
+  run_one "$CHAIR_ROLE" "$CHAIR_BACKEND"
+fi
 echo "ALL_COMMITTEE_DONE" > "$OUT/_status.txt"
 echo "committee run complete -> $OUT (members: $(wc -l < "$MEMBERS_FILE" | tr -d ' '))"
