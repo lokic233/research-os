@@ -90,6 +90,40 @@ inbox=load(os.path.join(rd,"orchestrator","inbox.yaml"),{"items":[]}) or {"items
 pending=[i for i in inbox["items"] if not i.get("acked")]
 pending_action=[i for i in pending if i.get("needs_action")]
 
+# --- STUCK-STATE detector (idle-while-waiting backstop) ---
+stuck=[]
+for fn in glob.glob(os.path.join(root,"registry","experiments","EXP-*.yaml")):
+    e=load(fn,{}) or {}
+    if e.get("status")=="completed" and e.get("claim_id"):
+        cf=os.path.join(root,"registry","claims",f"{e['claim_id']}.yaml"); c=load(cf,{}) or {}
+        # completed exp but claim still seed/active AND no verdict referencing it -> orchestrator didn't process
+        vfound=any((load(vf,{}) or {}).get("claim_id")==e["claim_id"] for vf in glob.glob(os.path.join(root,"registry","verdicts","VERDICT-*.yaml")))
+        if c.get("status") in ("seed","active") and not vfound and e.get("result_effect") in ("support","promote","keep-exploring"):
+            stuck.append(f"{e['exp_id']} done(effect={e.get('result_effect')}) but {e['claim_id']} still {c.get('status')}, no verdict")
+for d in glob.glob(os.path.join(rd,"committee_run_*")):
+    if os.path.exists(os.path.join(d,"_status.txt")):
+        run=os.path.basename(d)
+        # committee done — is there a verdict newer than it?
+        if not glob.glob(os.path.join(root,"registry","verdicts","VERDICT-*.yaml")):
+            stuck.append(f"{run} committee DONE but no VERDICT written")
+
+# --- STUCK-STATE detector (idle-while-waiting backstop) ---
+stuck=[]
+for fn in glob.glob(os.path.join(root,"registry","experiments","EXP-*.yaml")):
+    e=load(fn,{}) or {}
+    if e.get("status")=="completed" and e.get("claim_id"):
+        cf=os.path.join(root,"registry","claims",f"{e['claim_id']}.yaml"); c=load(cf,{}) or {}
+        # completed exp but claim still seed/active AND no verdict referencing it -> orchestrator didn't process
+        vfound=any((load(vf,{}) or {}).get("claim_id")==e["claim_id"] for vf in glob.glob(os.path.join(root,"registry","verdicts","VERDICT-*.yaml")))
+        if c.get("status") in ("seed","active") and not vfound and e.get("result_effect") in ("support","promote","keep-exploring"):
+            stuck.append(f"{e['exp_id']} done(effect={e.get('result_effect')}) but {e['claim_id']} still {c.get('status')}, no verdict")
+for d in glob.glob(os.path.join(rd,"committee_run_*")):
+    if os.path.exists(os.path.join(d,"_status.txt")):
+        run=os.path.basename(d)
+        # committee done — is there a verdict newer than it?
+        if not glob.glob(os.path.join(root,"registry","verdicts","VERDICT-*.yaml")):
+            stuck.append(f"{run} committee DONE but no VERDICT written")
+
 # --- write report ---
 os.makedirs(os.path.join(rd,"monitor"),exist_ok=True)
 ts=NOW.strftime("%Y%m%d-%H%M%S")
@@ -112,13 +146,19 @@ P(f"## Researcher Q&A / blocks ({len(qa)}):")
 for aid,note in qa: P(f"   - {aid}: {note[:80]}")
 if not qa: P("   (none)")
 if stale: P(f"## ⏳ STALE (within grace, patient-wait): {', '.join(r[0] for r in stale)}")
+if stuck:
+    P(f"## 🔁 STUCK STATE (completed-but-unprocessed — AUTO-REVIVE orchestrator):")
+    for x in stuck: P(f"   - {x}")
+if stuck:
+    P(f"## 🔁 STUCK STATE (completed-but-unprocessed — AUTO-REVIVE orchestrator):")
+    for x in sorted(set(stuck)): P(f"   - {x}")
 if dead: P(f"## ☠️ DEAD (past {grace}m grace — RESPAWN NEEDED): {', '.join(r[0] for r in dead)}")
 else: P(f"## ✅ no dead agents")
 # machine-readable sidecar
 side={"ts":ts,"window_min":W,"delta":{"claims":len(new_claims),"experiments":len(done_exps),"verdicts":len(new_verdicts)},
       "researchers":[{"id":r[0],"role":r[1],"state":r[4],"age_min":r[3]} for r in researchers],
       "committee_runs":[{"run":n,"status":s,"votes":v} for n,s,v in comm_runs],
-      "reports_in_window":reports_in_window,"silent_researchers":[a for a,_,_ in silent_researchers],"inbox_pending":len(pending),"inbox_need_action":len(pending_action),"qa":[{"id":a_,"note":n} for a_,n in qa],"dead":[r[0] for r in dead],"stale":[r[0] for r in stale]}
+      "reports_in_window":reports_in_window,"silent_researchers":[a for a,_,_ in silent_researchers],"inbox_pending":len(pending),"inbox_need_action":len(pending_action),"qa":[{"id":a_,"note":n} for a_,n in qa],"dead":[r[0] for r in dead],"stale":[r[0] for r in stale],"stuck":stuck}
 open(os.path.join(rd,"monitor",f"report-{ts}.md"),"w").write("\n".join(lines))
 open(os.path.join(rd,"monitor",f"report-{ts}.json"),"w").write(json.dumps(side,indent=2))
 print(f"\n(report saved: runtime/monitor/report-{ts}.md)")
