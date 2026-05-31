@@ -136,7 +136,7 @@ def cmd_exp_register(args):
                             "max_memory_gb": args.max_mem_gb, "host_mem_floor_gb": args.host_mem_floor},
         "needs_gpu": (args.max_gpu_hours or 0) > 0, "dispatched_by": "", "node_lease": "",
         "status": "pending", "result_summary": "", "result_effect": "",
-        "artifacts_path": f"experiments/{eid}/", "reproducibility": "", "linked_verdicts": [],
+        "artifacts_path": "", "reproducibility": "", "linked_verdicts": [],
         "started_at": "", "completed_at": "", "prompt_version": args.prompt_version or "",
     }
     import datetime as _d
