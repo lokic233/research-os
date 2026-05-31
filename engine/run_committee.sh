@@ -64,17 +64,29 @@ Output ONLY your structured vote block for role $role."
     *)                      echo "ERROR: unknown backend '$backend' for role $role (no CLI shape match)" >"$OUT/${role}.err"; : >"$OUT/${role}.out" ;;
   esac
   # BUG-12: flag empty/failed output so a parser never miscounts a no-op as a vote
-  if [ ! -s "$OUT/${role}.out" ]; then echo "EMPTY_OUTPUT_NO_VOTE role=$role backend=$backend" >>"$OUT/${role}.err"; fi
+  # BUG-20b: ONE automatic retry on empty output (transient gateway/concurrency empties — esp. claude under load)
+  if [ ! -s "$OUT/${role}.out" ]; then
+    sleep 5
+    case "$backend" in
+      claude-*|opus*|sonnet*) claude ${CLAUDE_SANDBOX_FLAG:---dangerously-disable-osx-sandbox} --model "$backend" -p "$full" </dev/null >"$OUT/${role}.out" 2>>"$OUT/${role}.err" ;;
+      codex*)                 codex --dangerously-disable-osx-sandbox exec --skip-git-repo-check "$full" </dev/null >"$OUT/${role}.out" 2>>"$OUT/${role}.err" ;;
+      gemini*)                gemini --dangerously-disable-osx-sandbox -p "$full" >"$OUT/${role}.out" 2>>"$OUT/${role}.err" ;;
+      metacode*|avocado*|muse*) metacode --dangerously-disable-osx-sandbox run --yolo "$full" </dev/null >"$OUT/${role}.out" 2>>"$OUT/${role}.err" ;;
+    esac
+  fi
+  if [ ! -s "$OUT/${role}.out" ]; then echo "EMPTY_OUTPUT_NO_VOTE role=$role backend=$backend (after 1 retry)" >>"$OUT/${role}.err"; fi
   echo "  done: $role ($backend)"
 }
 
 # BUG-16 fix: run the REVIEWERS in parallel first, then run area_chair LAST so it can actually
 # aggregate the finished reviewer .out files (it was racing them under all-parallel launch).
+# BUG-20b: stagger launches ~3s so concurrent claude processes don't overwhelm the gateway (empties).
 CHAIR_ROLE="" CHAIR_BACKEND=""
 while read -r role backend; do
   [ -z "$role" ] && continue
   if [ "$role" = "area_chair" ]; then CHAIR_ROLE="$role"; CHAIR_BACKEND="$backend"; continue; fi
   run_one "$role" "$backend" &
+  sleep 3
 done < "$MEMBERS_FILE"
 wait   # all reviewers done + .out files flushed
 if [ -n "$CHAIR_ROLE" ]; then
