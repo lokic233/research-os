@@ -78,20 +78,38 @@ Output ONLY your structured vote block for role $role."
   echo "  done: $role ($backend)"
 }
 
-# BUG-16 fix: run the REVIEWERS in parallel first, then run area_chair LAST so it can actually
-# aggregate the finished reviewer .out files (it was racing them under all-parallel launch).
-# BUG-20b: stagger launches ~3s so concurrent claude processes don't overwhelm the gateway (empties).
+# BUG-16: reviewers in parallel first, then area_chair LAST (so it can aggregate their finished .out).
+# BUG-20b: stagger ~3s so concurrent claude procs don't overwhelm the gateway.
+# BUG-21: pre-create .err for every member up front + VERIFY all produced .out before signalling DONE,
+#         so a dropped/never-invoked member is ALWAYS caught (never a false ALL_COMMITTEE_DONE).
 CHAIR_ROLE="" CHAIR_BACKEND=""
+ALL_ROLES=""
 while read -r role backend; do
   [ -z "$role" ] && continue
+  ALL_ROLES="$ALL_ROLES $role"
+  : > "$OUT/${role}.err"   # BUG-21: ensure an .err exists even if run_one never executes
   if [ "$role" = "area_chair" ]; then CHAIR_ROLE="$role"; CHAIR_BACKEND="$backend"; continue; fi
   run_one "$role" "$backend" &
   sleep 3
 done < "$MEMBERS_FILE"
-wait   # all reviewers done + .out files flushed
+wait   # all reviewer jobs done + .out flushed
 if [ -n "$CHAIR_ROLE" ]; then
   echo "  (reviewers done; running $CHAIR_ROLE to aggregate)"
   run_one "$CHAIR_ROLE" "$CHAIR_BACKEND"
+fi
+# BUG-21: completion is gated on EVERY member having a non-empty .out (else INCOMPLETE + list missing)
+MISSING=""
+for role in $ALL_ROLES; do
+  if [ ! -s "$OUT/${role}.out" ]; then
+    MISSING="$MISSING $role"
+    grep -q EMPTY_OUTPUT_NO_VOTE "$OUT/${role}.err" 2>/dev/null || \
+      echo "EMPTY_OUTPUT_NO_VOTE role=$role (no output produced)" >> "$OUT/${role}.err"
+  fi
+done
+if [ -n "$MISSING" ]; then
+  echo "COMMITTEE_INCOMPLETE missing:$MISSING" > "$OUT/_status.txt"
+  echo "⚠️ committee INCOMPLETE -> $OUT (missing:$MISSING) — do NOT treat as a full committee"
+  exit 5
 fi
 echo "ALL_COMMITTEE_DONE" > "$OUT/_status.txt"
 echo "committee run complete -> $OUT (members: $(wc -l < "$MEMBERS_FILE" | tr -d ' '))"
