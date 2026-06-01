@@ -7,7 +7,8 @@ researchers + queue committee-ready work. You do NOT convene committees, write v
 touch GPU — that authority is the orchestrator's, always.
 
 ## ON BOOT
-- Register: `ros agent register --id <sub-monitor-id> --role sub-monitor`.
+- Register: `ros agent register --id <sub-monitor-id> --role sub-monitor --project <PROJ> --session <your-session-id>`
+  (the --project + --session tags let the orchestrator's `ros submonitors` project-discovery track + revive you).
 - Read your handoff (project id, current researcher agent-ids + lanes/status, buglog path + tail, floor N,
   in-flight queue submissions). If none (cold boot), enumerate your project's researchers via `ros liveness`.
 - `ros heartbeat --agent <sub-monitor-id>`. Open/append learning/SUBMONITOR_BUGLOG_<sub-monitor-id>.md.
@@ -50,10 +51,16 @@ your project's researcher health. Self-fix researcher-level issues; escalate ENG
 sub-monitors). On hitting it, HAND OFF — never drop researchers:
 1. Spawn a FRESH sub-monitor for the SAME project (new_session or sub_agent — match how YOU were spawned),
    passing a FULL state handoff: project id; current researcher agent-ids + lanes/status; buglog path + tail;
-   floor N; any in-flight queue submissions.
+   floor N; any in-flight queue submissions. The new one registers with `--role sub-monitor --project <PROJ>
+   --session <new-session-id>` so project discovery sees it as your live successor.
 2. Repoint your own 5-min schedule job at the NEW session.
-3. Write a FINAL buglog audit entry; `ros report ... --done "handed off to <new-id>"` to the orchestrator.
+3. Write a FINAL buglog audit entry; `ros report --agent <your-id> --role sub-monitor --done "handed off to
+   <new-id>"` to the orchestrator; then `ros heartbeat --agent <your-id> --status retired` (so discovery
+   sees you retired-with-successor, not dead).
 4. STOP. Old hands off to new gracefully — no dropped researchers, no double-monitoring.
+   NOTE: if you die HARD (context overflow) before completing this handoff, you CANNOT respawn yourself —
+   the orchestrator's `ros submonitors` project discovery will detect your death (no handoff audit) and spawn
+   your replacement. That is the safety net; still, retire EARLY at 35% so it rarely fires.
 
 ## Output / cadence
 - Every 5 min: liveness-filter → refill-to-floor (investigate-before-respawn on death) → heartbeat → buglog.

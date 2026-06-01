@@ -55,6 +55,9 @@ research:                      # BOOTSTRAP knobs for researcher fan-out + orches
     enabled: true              # spawn one sub-monitor per project to own researcher health
     one_per_project: true
     monitor_interval_minutes: 5   # sub-monitor checks its project's researchers this often
+    discovery_interval_minutes: 10  # orchestrator runs `ros submonitors` project-discovery this often to
+                               #   respawn any project's MISSING/DEAD sub-monitor (dead ones can't respawn
+                               #   themselves — esp. on context overflow before graceful handoff)
     retire_at_context_pct: 35  # GLOBAL retire-and-respawn threshold for long-running/standby agents
                                #   (orchestrator, monitor, sub-monitors): graceful handoff at this % context
 liveness:

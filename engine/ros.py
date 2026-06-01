@@ -350,6 +350,7 @@ def cmd_agent_register(args):
     rec = {"agent_id": args.id, "role": args.role, "backend": args.backend or "",
            "node": args.node or "", "status": "running", "spawned_at": NOW(),
            "last_heartbeat": NOW(), "current_claim_id": args.claim or "", "current_exp_id": args.exp or "",
+           "project_id": getattr(args, "project", "") or "", "session_id": getattr(args, "session", "") or "",
            "note": "", "heartbeat_count": 0}
     dump_yaml(os.path.join(d, f"{args.id}.yaml"), rec)
     print(f"✅ agent {args.id} registered (role={args.role}). Heartbeat: `ros heartbeat --agent {args.id}` every ~{(_cfg(root).get('liveness') or {}).get('kick_interval_minutes',15)}m")
@@ -370,6 +371,8 @@ def cmd_heartbeat(args):
     if args.note: rec["note"] = args.note
     if args.claim: rec["current_claim_id"] = args.claim
     if args.exp: rec["current_exp_id"] = args.exp
+    if getattr(args, "project", None): rec["project_id"] = args.project
+    if getattr(args, "session", None): rec["session_id"] = args.session
     dump_yaml(p, rec)
     print(f"💓 {args.agent} heartbeat #{rec['heartbeat_count']} ({rec.get('status','?')})")
 
@@ -539,6 +542,89 @@ def cmd_projects(args):
         last=os.path.basename(os.path.dirname(reports[-1])) if reports else "no report"
         print(f"  {pid}: {title}  (latest progress: {last})")
 
+
+def cmd_submonitors(args):
+    """PROJECT DISCOVERY + sub-monitor health (ORCHESTRATOR duty). Enumerates every active project and
+    reports the health of its sub-monitor. The orchestrator runs this on a cadence: any project whose
+    sub-monitor is DEAD/stale/MISSING must get a fresh sub-monitor spawned by the ORCHESTRATOR (a dead
+    sub-monitor cannot respawn itself — especially on context-window overflow before it could hand off).
+
+    A sub-monitor that died WITHOUT a graceful-handoff audit (no recent 'handed off' report) is the
+    context-overflow case: the orchestrator owns the respawn. Exit non-zero if any project needs action,
+    so a wrapper/cron can branch on it."""
+    import datetime as _dt
+    root = inst_root(args); rd = runtime_dir(root); cfg = _cfg(root)
+    liv = cfg.get("liveness", {}) or {}
+    kick = int(liv.get("kick_interval_minutes", 15)); grace = int(liv.get("patient_grace_minutes", 45))
+    now = _dt.datetime.now(_dt.timezone.utc)
+    projects = sorted(os.path.basename(p) for p in glob.glob(os.path.join(root, "projects", "PROJ-*")))
+    # index sub-monitor agents by project (role==sub-monitor or 'sub-monitor'/'submonitor' in the id)
+    sm_by_proj = {}
+    for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
+        a = load_yaml(fn, {}) or {}
+        aid = a.get("agent_id", ""); role = a.get("role", "")
+        if role == "sub-monitor" or "sub-monitor" in aid or "submonitor" in aid:
+            try:
+                last = _dt.datetime.strptime(a.get("last_heartbeat",""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+                age = (now - last).total_seconds() / 60.0
+            except Exception:
+                age = 1e9
+            pid = a.get("project_id", "") or _infer_proj_from_id(aid)
+            # keep the freshest sub-monitor per project
+            cur = sm_by_proj.get(pid)
+            if cur is None or age < cur["age"]:
+                sm_by_proj[pid] = {"id": aid, "status": a.get("status","?"), "age": round(age,1)}
+    need = []
+    print(f"SUB-MONITOR DISCOVERY (kick={kick}m, grace={grace}m) — {len(projects)} active project(s):")
+    for pid in projects:
+        sm = sm_by_proj.get(pid)
+        if not sm:
+            print(f"  ❌ {pid}: NO sub-monitor — orchestrator must spawn one."); need.append((pid,"missing")); continue
+        st = sm["status"]; age = sm["age"]
+        if st in ("completed","retired"):
+            # retired = should have handed off; only an issue if no successor took over (no fresh sub-monitor)
+            print(f"  🏁 {pid}: {sm['id']} retired (last {age}m) — verify a successor exists; if not, respawn.")
+            need.append((pid,"retired-no-successor"))
+        elif st == "failed" or age > grace:
+            # DEAD: did it hand off? a graceful retire leaves a 'handed off' report; absence => context-overflow death
+            handed = _had_handoff(rd, sm["id"])
+            tag = "DEAD" if age > grace else "failed"
+            extra = "" if handed else " (NO handoff audit — likely context overflow; orchestrator owns respawn)"
+            print(f"  ☠️ {pid}: {sm['id']} {tag} last={age}m{extra} — orchestrator MUST spawn a replacement.")
+            need.append((pid,"dead"))
+        elif age > kick*1.5:
+            print(f"  ⏳ {pid}: {sm['id']} STALE last={age}m (within grace) — watch; respawn if it crosses {grace}m.")
+        else:
+            print(f"  💓 {pid}: {sm['id']} alive last={age}m.")
+    if need:
+        print(f"\n⚠️ {len(need)} project(s) need a sub-monitor (re)spawn by the ORCHESTRATOR:")
+        for pid, why in need: print(f"   - {pid}: {why}")
+        sys.exit(3)
+    print("\n✅ every active project has a live sub-monitor.")
+
+def _infer_proj_from_id(aid):
+    m = re.search(r"(PROJ-\d+)", aid or "")
+    if m: return m.group(1)
+    m = re.search(r"(?:sub-?monitor|submonitor)[-_]?(?:p|proj)?(\d+)", aid or "", re.I)
+    if m: return f"PROJ-{int(m.group(1)):04d}"
+    return ""
+
+def _had_handoff(rd, agent_id):
+    """True if the sub-monitor filed a graceful-handoff report (its last report mentions handoff/retire).
+    Absence on a DEAD sub-monitor => it died WITHOUT handing off (context-overflow case)."""
+    import json as _json
+    p = os.path.join(rd, "reports", f"{agent_id}.jsonl")
+    if not os.path.exists(p): return False
+    try:
+        lines = [l for l in open(p) if l.strip()]
+        for l in reversed(lines[-5:]):
+            r = _json.loads(l)
+            blob = " ".join(str(r.get(k,"")) for k in ("done","doing","next")).lower()
+            if "hand" in blob and "off" in blob or "handed off" in blob or "retire" in blob:
+                return True
+    except Exception:
+        pass
+    return False
 
 def cmd_exp_gc(args):
     """BUG-23: retire orphan pending experiments (registered but never completed) + clear their dangling
@@ -895,12 +981,15 @@ def main():
     agr = ags.add_parser("register")
     agr.add_argument("--id", required=True); agr.add_argument("--role", required=True)
     agr.add_argument("--backend"); agr.add_argument("--node"); agr.add_argument("--claim"); agr.add_argument("--exp")
+    agr.add_argument("--project", help="project this agent owns (sub-monitors/researchers)"); agr.add_argument("--session", help="this agent's own session id (for revival/handoff)")
     agr.set_defaults(fn=cmd_agent_register)
     hb = sub.add_parser("heartbeat")
     hb.add_argument("--agent", required=True); hb.add_argument("--status"); hb.add_argument("--note")
     hb.add_argument("--role"); hb.add_argument("--claim"); hb.add_argument("--exp")
+    hb.add_argument("--project"); hb.add_argument("--session")
     hb.set_defaults(fn=cmd_heartbeat)
     sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
+    sub.add_parser("submonitors").set_defaults(fn=cmd_submonitors)
     rp = sub.add_parser("report")
     rp.add_argument("--agent", required=True); rp.add_argument("--role")
     rp.add_argument("--done"); rp.add_argument("--doing"); rp.add_argument("--blocked")
