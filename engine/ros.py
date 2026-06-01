@@ -74,9 +74,28 @@ def find_obj(root, kind, oid):
 def obj_dir(root, kind, project_id, date=None):
     """Target dir for a NEW object: registry/<kind>/<PROJ>/<date>/."""
     import datetime as _d
-    date = date or _d.datetime.now(_d.timezone.utc).strftime("%Y-%m-%d")
+    date = _valid_date(date)
     d = os.path.join(reg_dir(root, kind), project_id or "PROJ-0000", date)
     os.makedirs(d, exist_ok=True); return d
+
+def _valid_date(date=None):
+    """Return a sane UTC YYYY-MM-DD. BUG-27 fix: reject malformed/sentinel/out-of-window dates
+    (e.g. a stray --date 9999-01-01 created a phantom verdicts/<PROJ>/9999-01-01/ dir). A supplied
+    date must parse as YYYY-MM-DD and fall within [today-30d, today+1d] UTC; otherwise fall back to
+    UTC today (with a stderr warning) so no future/garbage date folders can ever be minted again."""
+    import datetime as _d
+    today = _d.datetime.now(_d.timezone.utc).date()
+    if not date:
+        return today.strftime("%Y-%m-%d")
+    try:
+        d = _d.datetime.strptime(str(date), "%Y-%m-%d").date()
+    except Exception:
+        sys.stderr.write(f"⚠️ ignoring malformed --date '{date}' (need YYYY-MM-DD); using UTC today.\n")
+        return today.strftime("%Y-%m-%d")
+    if d > today + _d.timedelta(days=1) or d < today - _d.timedelta(days=30):
+        sys.stderr.write(f"⚠️ ignoring out-of-window --date '{date}' (not within today±); using UTC today.\n")
+        return today.strftime("%Y-%m-%d")
+    return d.strftime("%Y-%m-%d")
 
 def next_id(root, kind, prefix):
     """Next zero-padded id. Experiments live as experiments/<date>/<EXP-id>/ (dir names);
@@ -1066,7 +1085,7 @@ def cmd_verdict_write(args):
                 return
     vid=next_id(root,"verdicts","VERDICT")
     import datetime as _d
-    date=args.date or _d.datetime.now(_d.timezone.utc).strftime("%Y-%m-%d")
+    date=_valid_date(args.date)
     obj={"verdict_id":vid,"claim_id":args.claim,"project_id":pid,"date":date,
          "experiment_ids":exp_ids,"experiment_paths":exp_paths,
          "committee_version":args.committee_version or comm.get("rubric_version","v001"),"prompt_versions":{},
