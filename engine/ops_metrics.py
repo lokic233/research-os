@@ -32,7 +32,7 @@ def proj_of(path, default="UNKNOWN"):
     return yread(path).get("project_id", default) or default
 
 def blank(): return {"claims":0,"verdicts":0,"cemetery":0,"experiments_total":0,"cpu_exp":0,
-    "gpu_exp":0,"exp_completed":0,"exp_running":0,"committee_done":0,"committee_incomplete":0,
+    "gpu_exp":0,"exp_completed":0,"exp_running":0,
     "verdict_green":0,"verdict_yellow":0,"verdict_other":0}
 
 def main():
@@ -114,9 +114,11 @@ def _series(path):
     return rows
 
 def render(oproot, projects):
-    payload={"instance":_series(os.path.join(oproot,"_instance_alltime.jsonl")),
-             "projects":{p:_series(os.path.join(oproot,p,"metrics_alltime.jsonl")) for p in projects}}
-    tmpl=open(os.path.join(os.path.dirname(__file__),"ops_dashboard_template.html")).read()
-    return tmpl.replace("__DATA__", json.dumps(payload))
+    series_proj={p:_series(os.path.join(oproot,p,"metrics_alltime.jsonl")) for p in projects}
+    inst=_series(os.path.join(oproot,"_instance_alltime.jsonl"))
+    import importlib.util as _u
+    _p=os.path.join(os.path.dirname(__file__),"ops_render.py")
+    _s=_u.spec_from_file_location("ops_render",_p); _m=_u.module_from_spec(_s); _s.loader.exec_module(_m)
+    return _m.render(inst, series_proj)
 
 if __name__=="__main__": main()
