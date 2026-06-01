@@ -23,12 +23,12 @@
 
 ## Done (added)
 - [x] Progress-report channel (ros report/inbox/reports-age) — fixes the idle-orchestrator bug
-- [x] Unified `researcher` role: literature/skeptic/experiment/synthesis are SKILLS (session_agents/skills/),
+- [x] Unified `researcher` role: literature/skeptic/experiment/synthesis are SKILLS (researchers/skills/),
       one full-capability researcher owns the whole loop; N spawn in PARALLEL (validated: 3 parallel lanes + inbox)
 
 ## Done (added)
 - [x] Progress-report channel (ros report/inbox/reports-age) — fixes the idle-orchestrator bug
-- [x] Unified `researcher` role: literature/skeptic/experiment/synthesis are SKILLS (session_agents/skills/),
+- [x] Unified `researcher` role: literature/skeptic/experiment/synthesis are SKILLS (researchers/skills/),
       one full-capability researcher owns the whole loop; N spawn in PARALLEL (validated: 3 parallel lanes + inbox)
 
 ## Next (in priority order)

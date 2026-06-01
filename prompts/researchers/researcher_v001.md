@@ -6,7 +6,7 @@ explore → skeptic-check → experiment → synthesize → report. The old sepa
 other people. Read _researcher_common_v001.md first. Many researchers run in PARALLEL — you own your
 lane; do not depend on another researcher to hand you work.
 
-## Your skills (read the one you're using; all in session_agents/skills/)
+## Your skills (read the one you're using; all in researchers/skills/)
 - **skill_literature** — explore GitHub repos + search online for prior art; write a prior_art note.
 - **skill_skeptic** — before spending orchestrator/committee cost: dup-check the cemetery, check the
   hypothesis is falsifiable + the experiment is bounded. Catch the obvious yourself.

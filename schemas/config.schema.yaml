@@ -13,6 +13,7 @@ compute_nodes: []              # [{name, kind, gpu_type, gpu_count, host_mem_gb,
                                #   probe_cmd: shell cmd the orchestrator runs to check the node is alive
                                #   (e.g. "ssh <node> nvidia-smi --query-gpu=name --format=csv,noheader")
 session_agent_backends: []     # backends researchers can use (e.g. local codex/claude CLI) — config, not code
+                               #   (key name kept for back-compat; 'session_agents' are now called 'researchers')
 # --- agent embodiment + resource pools ---
 agent_embodiment:
   orchestrator: interactive    # new_session, human-in-the-loop, revivable via agent_run.message
@@ -45,8 +46,17 @@ committee:                     # logical-standing, physically-on-demand
   green_rule: unanimous        # what counts as GREEN
 research:                      # BOOTSTRAP knobs for researcher fan-out + orchestrator self-monitoring
   researchers_per_project: 2   # LIVE researchers each project must always have; floor = this * #active_projects
+                               #   (renamed concept: session_agents are now called 'researchers'; they use
+                               #    the session_agent_backends config field above)
   self_check_interval_minutes: 10  # orchestrator self-checks researcher heartbeats/health on this cadence
-                               #   (orchestrator owns this loop; the monitor is only a backstop)
+                               #   (now DELEGATED to per-project sub-monitors; orchestrator/monitor are backstops)
+  sub_monitor:                 # per-project standby that owns researcher health/floor/debug (decouples it
+                               #   from the orchestrator). One sub-monitor per active project.
+    enabled: true              # spawn one sub-monitor per project to own researcher health
+    one_per_project: true
+    monitor_interval_minutes: 5   # sub-monitor checks its project's researchers this often
+    retire_at_context_pct: 35  # GLOBAL retire-and-respawn threshold for long-running/standby agents
+                               #   (orchestrator, monitor, sub-monitors): graceful handoff at this % context
 liveness:
   mode: push                   # agents kick the supervisor; supervisor does not poll-kill
   kick_interval_minutes: 15    # each agent reports alive every ~15m

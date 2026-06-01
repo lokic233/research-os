@@ -785,6 +785,74 @@ def cmd_resume(args):
         if nxt: print(f"      NEXT: {nxt}")
 
 
+# ============================ committee-submission queue (sub-monitor -> orchestrator) ============================
+# DECOUPLING (v2 routing): researchers report to their PER-PROJECT SUB-MONITOR (not the orchestrator).
+# A sub-monitor that judges a researcher's proposal committee-ready pushes a SUBMISSION REQUEST onto this
+# queue. The orchestrator CONSUMES the queue (`ros queue list`) and convenes the honest committee — it no
+# longer manages/debugs researchers directly. This keeps the orchestrator off the researcher-debug hot path.
+def _queue_path(root):
+    return os.path.join(runtime_dir(root), "orchestrator", "committee_queue.yaml")
+
+def cmd_queue_submit(args):
+    """SUB-MONITOR pushes a committee-submission request for a researcher proposal that is ready for review.
+    The orchestrator pulls these (`ros queue list`) and convenes the committee. Decouples researcher mgmt
+    (sub-monitor) from committee orchestration (orchestrator)."""
+    root = inst_root(args); rd = runtime_dir(root)
+    os.makedirs(os.path.join(rd, "orchestrator"), exist_ok=True)
+    # claim must exist (a committee reviews a claim's evidence)
+    if args.claim and args.claim != "none":
+        if not find_obj(root, "claims", args.claim):
+            sys.exit(f"❌ claim {args.claim} not found — submit a real claim id (or seed it first).")
+    exp_ids = [e.strip() for e in (args.exp or "").split(",") if e.strip()]
+    for eid in exp_ids:
+        if not glob.glob(os.path.join(root, "experiments", "**", eid, "experiment.yaml"), recursive=True):
+            sys.exit(f"❌ experiment {eid} not found — a submission must cite real EXP evidence.")
+    q = load_yaml(_queue_path(root), {"queue": []}) or {"queue": []}
+    qid = f"Q-{len(q['queue'])+1:04d}"
+    # idempotency: don't double-submit the same (claim, exp-set) while still pending
+    for it in q["queue"]:
+        if (not it.get("acked") and it.get("claim_id") == args.claim
+                and sorted(it.get("experiment_ids") or []) == sorted(exp_ids)):
+            print(f"↩︎ already queued as {it.get('queue_id')} (claim {args.claim}, exps {exp_ids}) — not duplicating.")
+            return
+    rec = {"queue_id": qid, "claim_id": args.claim, "project_id": args.project or "",
+           "experiment_ids": exp_ids, "submitted_by": args.by or "", "researcher": args.researcher or "",
+           "kind": args.kind or "committee", "summary": args.summary or "", "priority": args.priority or 0,
+           "submitted_at": NOW(), "acked": False, "acked_by": "", "acked_at": "", "answer": ""}
+    q["queue"].append(rec); dump_yaml(_queue_path(root), q)
+    print(f"✅ {qid} submitted to orchestrator committee-queue (claim {args.claim}, kind={rec['kind']}, "
+          f"exps={exp_ids or '—'}, by={rec['submitted_by'] or '?'})")
+
+def cmd_queue_list(args):
+    """ORCHESTRATOR pulls pending committee-submission requests from the sub-monitors. This is the
+    decoupled replacement for poking researchers: the orchestrator acts only on queued, vetted submissions."""
+    root = inst_root(args)
+    q = load_yaml(_queue_path(root), {"queue": []}) or {"queue": []}
+    items = [i for i in q["queue"] if (args.all or not i.get("acked"))]
+    if not items: print("(committee-queue empty — no pending submissions)"); return
+    print(f"COMMITTEE QUEUE — {len(items)} {'total' if args.all else 'pending'}:")
+    for i in sorted(items, key=lambda x: -x.get("priority", 0)):
+        tag = "✓acked" if i.get("acked") else "⏳PENDING"
+        print(f"  [{tag}] {i['queue_id']} {i.get('submitted_at','')} claim={i.get('claim_id')} "
+              f"({i.get('project_id') or '?'}) kind={i.get('kind')}")
+        if i.get("researcher"): print(f"          researcher: {i['researcher']}  (via {i.get('submitted_by','?')})")
+        if i.get("experiment_ids"): print(f"          cites: {', '.join(i['experiment_ids'])}")
+        if i.get("summary"):  print(f"          summary: {i['summary']}")
+        if i.get("acked") and i.get("answer"): print(f"          answer:  {i['answer']}")
+
+def cmd_queue_ack(args):
+    """ORCHESTRATOR marks a submission consumed (committee convened / deferred / rejected, with a reason)."""
+    root = inst_root(args); p = _queue_path(root)
+    q = load_yaml(p, {"queue": []}) or {"queue": []}
+    n = 0
+    for i in q["queue"]:
+        if not i.get("acked") and (args.all or i.get("queue_id") == args.id):
+            i["acked"] = True; i["acked_at"] = NOW(); i["acked_by"] = args.by or "orchestrator"
+            i["answer"] = args.answer or ""; n += 1
+    dump_yaml(p, q)
+    print(f"✅ acked {n} queue item(s)" + (f": {args.answer}" if args.answer else ""))
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -846,6 +914,21 @@ def main():
     iba.set_defaults(fn=cmd_inbox_ack)
     ra = sub.add_parser("reports-age"); ra.add_argument("--window-min", dest="window_min", type=int, default=10)
     ra.set_defaults(fn=cmd_reports_age)
+    # committee-submission queue (sub-monitor -> orchestrator decoupling)
+    qp = sub.add_parser("queue"); qps = qp.add_subparsers(dest="sub", required=True)
+    qsub = qps.add_parser("submit")
+    qsub.add_argument("--claim", required=True, help="CLAIM-id the proposal is ready to take to committee")
+    qsub.add_argument("--exp", help="EXP-id(s) cited as evidence, comma-separated")
+    qsub.add_argument("--project"); qsub.add_argument("--by", help="sub-monitor agent id")
+    qsub.add_argument("--researcher", help="researcher agent id whose proposal this is")
+    qsub.add_argument("--kind", help="committee|verdict|review (default committee)")
+    qsub.add_argument("--summary"); qsub.add_argument("--priority", type=int)
+    qsub.set_defaults(fn=cmd_queue_submit)
+    qls = qps.add_parser("list"); qls.add_argument("--all", action="store_true", help="include acked items")
+    qls.set_defaults(fn=cmd_queue_list)
+    qak = qps.add_parser("ack"); qak.add_argument("--id", help="queue id (Q-xxxx)")
+    qak.add_argument("--all", action="store_true"); qak.add_argument("--answer"); qak.add_argument("--by")
+    qak.set_defaults(fn=cmd_queue_ack)
     sp = sub.add_parser("seed"); ssub = sp.add_subparsers(dest="sub", required=True)
     sn = ssub.add_parser("new"); sn.add_argument("--claim", required=True); sn.add_argument("--why")
     sn.add_argument("--project"); sn.add_argument("--owner"); sn.add_argument("--prompt-version", dest="prompt_version")

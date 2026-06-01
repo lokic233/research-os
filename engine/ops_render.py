@@ -95,16 +95,17 @@ def render_md(inst_series, proj_series):
           ("cemetery",g("cemetery")),("experiments",g("experiments_total")),
           ("CPU exp",g("cpu_exp")),("GPU exp",g("gpu_exp")),("completed exp",g("exp_completed")),
           ("committee done",g("committee_done")),("committee incomplete",g("committee_incomplete")),
+          ("claim submissions",g("claim_submissions")),("submissions pending",g("submissions_pending")),
           ("GPU leases active",g("gpu_leases_active")),("GPU queue",g("gpu_queue_len"))]
     for k,v in rows: L.append("| %s | **%s** |"%(k,v))
     L.append("")
     L.append("## Per-project")
     L.append("")
-    L.append("| project | claims | verdicts | GREEN | CPU exp | GPU exp | experiments |")
-    L.append("|---|---|---|---|---|---|---|")
+    L.append("| project | claims | submissions | verdicts | GREEN | CPU exp | GPU exp | experiments |")
+    L.append("|---|---|---|---|---|---|---|---|")
     for p in pids:
-        L.append("| %s | %s | %s | %s | %s | %s | %s |"%(p,pv(p,"claims"),pv(p,"verdicts"),
-            pv(p,"verdict_green"),pv(p,"cpu_exp"),pv(p,"gpu_exp"),pv(p,"experiments_total")))
+        L.append("| %s | %s | %s | %s | %s | %s | %s | %s |"%(p,pv(p,"claims"),pv(p,"claim_submissions"),
+            pv(p,"verdicts"),pv(p,"verdict_green"),pv(p,"cpu_exp"),pv(p,"gpu_exp"),pv(p,"experiments_total")))
     L.append("")
     # claims bar
     mxc=max([pv(p,"claims") for p in pids]+[1])
@@ -120,6 +121,10 @@ def render_md(inst_series, proj_series):
     ratio=round(g("gpu_exp")/g("experiments_total")*100) if g("experiments_total") else 0
     gr=round(g("verdict_green")/g("verdicts")*100) if g("verdicts") else 0
     sig.append("✅ GPU-exp share **%d%%** · GREEN rate **%d%%** (%s/%s). CPU research is cheap+parallel; reserve GPU for serving cells."%(ratio,gr,g("verdict_green"),g("verdicts")))
+    if g("submissions_pending")>0:
+        sig.append("📥 **%d claim submission(s) PENDING** in the committee queue (sub-monitor→orchestrator) — orchestrator should convene/ack via `ros queue list`."%g("submissions_pending"))
+    if g("claim_submissions")>0:
+        sig.append("🧭 **Project flow**: %d claim submission(s) total, %d acked (committee convened/decided). Submission→verdict throughput is the progress signal."%(g("claim_submissions"),g("submissions_acked")))
     if pids:
         cl=[pv(p,"claims") for p in pids]
         if max(cl)-min(cl)>=4:
