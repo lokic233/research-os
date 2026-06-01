@@ -43,6 +43,10 @@ committee:                     # logical-standing, physically-on-demand
     - {role: product_realist,       backend: ""}
     - {role: area_chair,            backend: ""}
   green_rule: unanimous        # what counts as GREEN
+research:                      # BOOTSTRAP knobs for researcher fan-out + orchestrator self-monitoring
+  researchers_per_project: 2   # LIVE researchers each project must always have; floor = this * #active_projects
+  self_check_interval_minutes: 10  # orchestrator self-checks researcher heartbeats/health on this cadence
+                               #   (orchestrator owns this loop; the monitor is only a backstop)
 liveness:
   mode: push                   # agents kick the supervisor; supervisor does not poll-kill
   kick_interval_minutes: 15    # each agent reports alive every ~15m
