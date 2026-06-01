@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """ops_metrics.py - hourly operational snapshot for a research-os instance.
 
-CLEAN SEPARATION: this LOGIC lives in the engine repo; all observability DATA is written
+A UTILITY (lives in the engine repo's util/, not engine/ core). All observability DATA is written
 into the INSTANCE repo only, PER PROJECT:
   <instance>/operational/<UTC-date>/<PROJ>/metrics.jsonl   (per-project hourly timeseries)
   <instance>/operational/<PROJ>/metrics_alltime.jsonl      (per-project all-time series)
   <instance>/operational/<UTC-date>/dashboard.html         (rollup dashboard, all projects)
+  <instance>/operational/<UTC-date>/README.md              (GitHub-rendered markdown report)
   <instance>/operational/dashboard.html                    (latest rollup)
+  <instance>/operational/README.md                         (latest markdown report)
 Stdlib only; read-only over registry/experiments. Never writes into the engine repo.
-Usage: python3 ops_metrics.py --instance <ROOT>
+Usage: python3 util/ops_metrics.py --instance <ROOT>
 """
 import os, sys, glob, json, datetime, re
 
