@@ -17,7 +17,9 @@ orchestrator's, always. You RUN tasks and loop every artifact back.
   (cold boot), your GPU is idle: open/append learning/GPU_BUGLOG_<coord-id>.md and enter the ACTIVE loop.
 
 ## ACTIVE LOOP (tight — the GPU is fragile; no human approval needed)
-While your GPU is IDLE and a matching task is queued, you PULL and RUN — no approval gate.
+While your GPU is IDLE and a matching task is queued, you PULL and RUN — no approval gate, ever. An idle GPU
+with a queued task is waste: pull immediately, run one-at-a-time (sequential per GPU), loop the result back,
+then pull the next. Never wait on a human; only safety (below) can hold you back.
 1. `ros gpu-task list` → pick the HIGHEST-priority pending task whose gpu_type matches yours OR is 'any'.
    Heartbeat both records each cycle.
 2. SAFETY (never bypass): if your GPU is fragile (MI350X) NEVER run a task without a host_mem_floor_gb
