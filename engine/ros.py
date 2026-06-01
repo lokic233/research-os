@@ -776,6 +776,180 @@ def cmd_gpu_release(args):
     rel=q.get("leases",{}).pop(args.node,None); dump_yaml(_gpu_queue_path(root),q)
     print(f"released {args.node}" + (f" (was {rel})" if rel else " (no lease)"))
 
+
+# ============================ v2 STAGE B: backend registry + gpu task/result channels ============================
+# A backend (cpu|gpu) self-registers like an agent (per-file under runtime/registry/) + carries runtime
+# {status,current_task,lease,last_heartbeat}. The gpu TASK channel is the queue producers push to; the
+# registry is the table of who can PULL from it. Generic over kind; gpu_coordinators (Stage C) are the
+# consumers. All additive — the legacy `ros gpu queue/poll/release` path is untouched.
+def _backend_path(root, bid):
+    return os.path.join(runtime_dir(root), "registry", "backends", f"{bid}.yaml")
+
+def _gpu_tasks_path(root):
+    return os.path.join(runtime_dir(root), "orchestrator", "gpu_tasks.yaml")
+
+def _gpu_results_path(root):
+    return os.path.join(runtime_dir(root), "orchestrator", "gpu_results.yaml")
+
+def _gpu_task_channel(root):
+    return Channel(_gpu_tasks_path(root), list_key="tasks", id_prefix="GT")
+
+def _gpu_result_channel(root):
+    return Channel(_gpu_results_path(root), list_key="results", id_prefix="GR")
+
+def cmd_backend_register(args):
+    """A compute backend (cpu|gpu) self-registers into the runtime registry (per-file, mirrors agents/).
+    gpu_coordinators register their ONE GPU backend on boot; the gpu task channel routes work to it."""
+    root = inst_root(args); rd = runtime_dir(root)
+    d = os.path.join(rd, "registry", "backends"); os.makedirs(d, exist_ok=True)
+    p = _backend_path(root, args.id)
+    rec = load_yaml(p, {}) or {}
+    rec.update({"backend_id": args.id, "kind": args.kind, "gpu_type": args.gpu_type or "",
+                "node": args.node or "", "status": rec.get("status", "idle"),
+                "current_task": rec.get("current_task", ""), "lease": rec.get("lease", ""),
+                "host_mem_floor_gb": int(args.host_mem_floor or 0),
+                "last_heartbeat": NOW(), "spawned_at": rec.get("spawned_at", NOW()),
+                "heartbeat_count": int(rec.get("heartbeat_count", 0))})
+    dump_yaml(p, rec)
+    print(f"✅ backend {args.id} registered (kind={args.kind}, gpu_type={args.gpu_type or '—'}, node={args.node or '—'}, "
+          f"floor={rec['host_mem_floor_gb']}GB). Heartbeat: `ros backend heartbeat --id {args.id}`")
+
+def cmd_backend_heartbeat(args):
+    """Bump a backend's freshness + optionally update status/current_task/lease. Tolerant of
+    heartbeat-before-register (auto-creates a minimal record), mirroring cmd_heartbeat."""
+    root = inst_root(args); rd = runtime_dir(root)
+    p = _backend_path(root, args.id)
+    rec = load_yaml(p, {}) or {}
+    if not rec.get("backend_id"):
+        rec.setdefault("backend_id", args.id); rec.setdefault("spawned_at", NOW())
+        rec.setdefault("heartbeat_count", 0); rec.setdefault("kind", "")
+    rec["last_heartbeat"] = NOW()
+    rec["heartbeat_count"] = int(rec.get("heartbeat_count", 0)) + 1
+    if args.status: rec["status"] = args.status
+    if args.task is not None: rec["current_task"] = args.task
+    if args.lease is not None: rec["lease"] = args.lease
+    dump_yaml(p, rec)
+    print(f"💓 backend {args.id} heartbeat #{rec['heartbeat_count']} ({rec.get('status','?')})"
+          + (f" task={rec.get('current_task')}" if rec.get("current_task") else ""))
+
+def cmd_backend_list(args):
+    """List registered backends with freshness, reusing the config liveness kick/grace age logic
+    (same patient-grace semantics as cmd_liveness — never declare dead before the grace window)."""
+    import datetime as _dt
+    root = inst_root(args); rd = runtime_dir(root); cfg = _cfg(root)
+    liv = cfg.get("liveness", {}) or {}
+    kick = int(liv.get("kick_interval_minutes", 15)); grace = int(liv.get("patient_grace_minutes", 45))
+    now = _dt.datetime.now(_dt.timezone.utc)
+    rows = []
+    for fn in sorted(glob.glob(os.path.join(rd, "registry", "backends", "*.yaml"))):
+        b = load_yaml(fn, {}) or {}
+        try:
+            last = _dt.datetime.strptime(b.get("last_heartbeat",""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+            age = (now - last).total_seconds() / 60.0
+        except Exception:
+            age = 1e9
+        if b.get("status") in ("retired",):
+            state = "retired"
+        else:
+            state = "fresh" if age <= kick*1.5 else ("stale" if age <= grace else "DEAD")
+        rows.append((b.get("backend_id","?"), b.get("kind","?"), b.get("gpu_type","") or "—",
+                     b.get("node","") or "—", b.get("status","?"), round(age,1), state, b.get("current_task","") or ""))
+    if not rows: print("(no backends registered)"); return
+    print(f"BACKENDS (kick={kick}m, patient grace={grace}m):")
+    for bid, kind, gt, node, st, age, state, task in rows:
+        mark = {"fresh":"💓","stale":"⏳","DEAD":"☠️","retired":"🏁"}[state]
+        print(f"  {mark} {bid:18} {kind:4} {gt:8} {node:12} {st:8} last={age}m -> {state}"
+              + (f"  task={task}" if task else ""))
+    dead = [r[0] for r in rows if r[6]=="DEAD"]
+    if dead: print(f"  ⚠️ DEAD backends (past {grace}m grace): {', '.join(dead)}")
+
+def cmd_gpu_task_submit(args):
+    """ORCHESTRATOR pushes a committee-approved GPU experiment onto the gpu TASK channel. A gpu_coordinator
+    pulls the next matching task for its GPU. Mirrors the cmd_gpu_queue safety gates (committee + fragile)."""
+    root = inst_root(args); cfg = _cfg(root)
+    if Channel is None: sys.exit("❌ channeling unavailable — cannot use gpu task channel.")
+    hits = glob.glob(os.path.join(root, "experiments", "**", args.exp, "experiment.yaml"), recursive=True)
+    ef = hits[0] if hits else None; exp = load_yaml(ef) if ef else None
+    if not exp: sys.exit(f"❌ {args.exp} not found.")
+    if not (exp.get("committee_approved") or args.force):
+        sys.exit(f"❌ {args.exp} is not committee_approved — only committee-greenlit experiments enter the GPU "
+                 f"task channel (--force to override).")
+    floor = int(args.host_mem_floor if args.host_mem_floor is not None
+                else (exp.get("resource_budget") or {}).get("host_mem_floor_gb", 0) or 0)
+    gt = args.gpu_type or "any"
+    # SAFETY (mirror cmd_gpu_queue/dispatch): a task targeting a fragile compute_node with no watchdog floor
+    # is REFUSED — the coordinator would otherwise risk crashing the fragile node (MI350X postmortems).
+    node = next((n for n in (cfg.get("compute_nodes") or [])
+                 if n.get("gpu_type") == gt and n.get("fragile")), None)
+    if node is not None and floor <= 0:
+        sys.exit(f"❌ SAFETY: gpu_type '{gt}' maps to fragile node '{node.get('name')}' and this task has no "
+                 f"host_mem_floor_gb. Set --host-mem-floor (watchdog) before submitting. (See learning/ postmortems.)")
+    payload = {"exp_id": args.exp, "claim_id": exp.get("claim_id") or "", "gpu_type": gt,
+               "host_mem_floor_gb": floor, "priority": args.priority or 0,
+               "by": args.by or "", "summary": args.summary or ""}
+    r = _gpu_task_channel(root).submit(payload, dedup_keys=["exp_id"])
+    if r.get("dup"):
+        print(f"↩︎ already queued as {r['id']} (exp {args.exp}) — not duplicating."); return
+    print(f"✅ {r['id']} gpu-task submitted (exp {args.exp}, gpu={gt}, floor={floor}GB, prio={payload['priority']}). "
+          f"A gpu_coordinator for {gt} pulls it when its GPU is idle.")
+
+def cmd_gpu_task_list(args):
+    root = inst_root(args)
+    if Channel is None: sys.exit("❌ channeling unavailable.")
+    items = _gpu_task_channel(root).list(include_acked=args.all)
+    if not items: print("(gpu task channel empty — no pending tasks)"); return
+    print(f"GPU TASK CHANNEL — {len(items)} {'total' if args.all else 'pending'}:")
+    for i in sorted(items, key=lambda x: -x.get("priority", 0)):
+        tag = "✓acked" if i.get("acked") else "⏳PENDING"
+        print(f"  [{tag}] {i.get('id')} {i.get('submitted_at','')} exp={i.get('exp_id')} "
+              f"gpu={i.get('gpu_type')} floor={i.get('host_mem_floor_gb')}GB prio={i.get('priority',0)}")
+        if i.get("claim_id"): print(f"          claim: {i['claim_id']}")
+        if i.get("summary"):  print(f"          summary: {i['summary']}")
+        if i.get("acked") and i.get("answer"): print(f"          answer:  {i['answer']}")
+
+def cmd_gpu_task_ack(args):
+    root = inst_root(args)
+    if Channel is None: sys.exit("❌ channeling unavailable.")
+    n = _gpu_task_channel(root).ack(item_id=args.id, all_items=bool(args.all),
+                                    by=args.by or "", answer=args.answer or "")
+    print(f"✅ acked {n} gpu-task(s)" + (f": {args.answer}" if args.answer else ""))
+
+def cmd_gpu_result_submit(args):
+    """gpu_coordinator loops a completed (or faulted) GPU run's artifact back to the orchestrator via the
+    RESULT channel. The orchestrator drains these (`ros gpu-result list`) → `ros exp complete` → verdict."""
+    root = inst_root(args)
+    if Channel is None: sys.exit("❌ channeling unavailable.")
+    payload = {"exp_id": args.exp, "task_id": args.task or "", "effect": args.effect,
+               "summary": args.summary or "", "artifacts_path": args.artifacts_path or "",
+               "by": args.by or "", "fault": bool(args.fault)}
+    r = _gpu_result_channel(root).submit(payload, dedup_keys=["exp_id", "task_id"])
+    if r.get("dup"):
+        print(f"↩︎ result already submitted as {r['id']} (exp {args.exp}, task {args.task}) — not duplicating."); return
+    print(f"✅ {r['id']} gpu-result submitted (exp {args.exp}, effect={args.effect}"
+          + (", FAULT" if args.fault else "") + "). Orchestrator drains it via `ros gpu-result list`.")
+
+def cmd_gpu_result_list(args):
+    root = inst_root(args)
+    if Channel is None: sys.exit("❌ channeling unavailable.")
+    items = _gpu_result_channel(root).list(include_acked=args.all)
+    if not items: print("(gpu result channel empty — no pending results)"); return
+    print(f"GPU RESULT CHANNEL — {len(items)} {'total' if args.all else 'pending'}:")
+    for i in items:
+        tag = "✓acked" if i.get("acked") else "⏳PENDING"
+        fault = " ⚠️FAULT" if i.get("fault") else ""
+        print(f"  [{tag}] {i.get('id')} {i.get('submitted_at','')} exp={i.get('exp_id')} "
+              f"effect={i.get('effect')}{fault} (task {i.get('task_id') or '—'}, by {i.get('by') or '?'})")
+        if i.get("summary"):        print(f"          summary: {i['summary']}")
+        if i.get("artifacts_path"): print(f"          artifacts: {i['artifacts_path']}")
+        if i.get("acked") and i.get("answer"): print(f"          answer:  {i['answer']}")
+
+def cmd_gpu_result_ack(args):
+    root = inst_root(args)
+    if Channel is None: sys.exit("❌ channeling unavailable.")
+    n = _gpu_result_channel(root).ack(item_id=args.id, all_items=bool(args.all),
+                                      by=args.by or "", answer=args.answer or "")
+    print(f"✅ acked {n} gpu-result(s)" + (f": {args.answer}" if args.answer else ""))
+
 def cmd_verdict_write(args):
     """Write a committee VERDICT into verdicts/<PROJ>/<date>/, REQUIRING linked experiment ids that exist.
     Enforces config green_rule (BUG-3 fix): green/promote require full committee parity.
@@ -1008,6 +1182,41 @@ def main():
     gps.add_parser("status").set_defaults(fn=cmd_gpu_status)
     gpp=gps.add_parser("poll"); gpp.add_argument("--node",required=True); gpp.set_defaults(fn=cmd_gpu_poll)
     gpr=gps.add_parser("release"); gpr.add_argument("--node",required=True); gpr.set_defaults(fn=cmd_gpu_release)
+    # v2 STAGE B: backend registry
+    bk=sub.add_parser("backend"); bks=bk.add_subparsers(dest="sub",required=True)
+    bkr=bks.add_parser("register")
+    bkr.add_argument("--id",required=True); bkr.add_argument("--kind",required=True,choices=["cpu","gpu"])
+    bkr.add_argument("--gpu-type",dest="gpu_type"); bkr.add_argument("--node")
+    bkr.add_argument("--host-mem-floor",dest="host_mem_floor",type=int,default=0)
+    bkr.set_defaults(fn=cmd_backend_register)
+    bkh=bks.add_parser("heartbeat"); bkh.add_argument("--id",required=True)
+    bkh.add_argument("--status"); bkh.add_argument("--task"); bkh.add_argument("--lease")
+    bkh.set_defaults(fn=cmd_backend_heartbeat)
+    bks.add_parser("list").set_defaults(fn=cmd_backend_list)
+    # v2 STAGE B: gpu task channel (orchestrator -> gpu_coordinator)
+    gt=sub.add_parser("gpu-task"); gts=gt.add_subparsers(dest="sub",required=True)
+    gtsub=gts.add_parser("submit")
+    gtsub.add_argument("--exp",required=True); gtsub.add_argument("--gpu-type",dest="gpu_type",help="H100|MI350X|any")
+    gtsub.add_argument("--host-mem-floor",dest="host_mem_floor",type=int)
+    gtsub.add_argument("--priority",type=int); gtsub.add_argument("--by"); gtsub.add_argument("--summary")
+    gtsub.add_argument("--force",action="store_true",help="override committee-approval requirement (explicit)")
+    gtsub.set_defaults(fn=cmd_gpu_task_submit)
+    gtl=gts.add_parser("list"); gtl.add_argument("--all",action="store_true",help="include acked")
+    gtl.set_defaults(fn=cmd_gpu_task_list)
+    gta=gts.add_parser("ack"); gta.add_argument("--id"); gta.add_argument("--all",action="store_true")
+    gta.add_argument("--by"); gta.add_argument("--answer"); gta.set_defaults(fn=cmd_gpu_task_ack)
+    # v2 STAGE B: gpu result channel (gpu_coordinator -> orchestrator)
+    gr=sub.add_parser("gpu-result"); grs=gr.add_subparsers(dest="sub",required=True)
+    grsub=grs.add_parser("submit")
+    grsub.add_argument("--exp",required=True); grsub.add_argument("--task",help="GT-id this result is for")
+    grsub.add_argument("--effect",required=True,help="kill|weaken|keep-exploring|promote|archive|support")
+    grsub.add_argument("--summary"); grsub.add_argument("--artifacts-path",dest="artifacts_path")
+    grsub.add_argument("--by"); grsub.add_argument("--fault",action="store_true",help="run faulted (crash/host-mem)")
+    grsub.set_defaults(fn=cmd_gpu_result_submit)
+    grl=grs.add_parser("list"); grl.add_argument("--all",action="store_true",help="include acked")
+    grl.set_defaults(fn=cmd_gpu_result_list)
+    gra=grs.add_parser("ack"); gra.add_argument("--id"); gra.add_argument("--all",action="store_true")
+    gra.add_argument("--by"); gra.add_argument("--answer"); gra.set_defaults(fn=cmd_gpu_result_ack)
     ca=sub.add_parser("claim"); cas=ca.add_subparsers(dest="sub",required=True)
     cav=cas.add_parser("advance")
     cav.add_argument("--claim",required=True); cav.add_argument("--state",required=True,help="lifecycle_state")
