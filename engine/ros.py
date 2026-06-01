@@ -9,6 +9,14 @@ Dependencies: pyyaml only. Python 3.9+.
 """
 import argparse, os, sys, re, datetime, glob, hashlib
 
+# v2: shared generic queue/inbox abstraction (engine/channeling). Import shim so it resolves whether
+# ros.py is run by path or imported. Falls back to None if unavailable (older checkouts) — callers guard.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from channeling import Channel
+except Exception:
+    Channel = None
+
 def _yaml():
     try:
         import yaml; return yaml
@@ -455,10 +463,16 @@ def cmd_report(args):
     with open(os.path.join(rd, "reports", f"{args.agent}.jsonl"), "a") as f:
         f.write(_json.dumps(rec) + "\n")
     # inbox entry for the orchestrator (questions/blocks flagged for action)
-    inbox = load_yaml(os.path.join(rd, "orchestrator", "inbox.yaml"), {"items": []}) or {"items": []}
     needs_action = bool(args.blocked or args.need)
-    inbox["items"].append({**rec, "acked": False, "needs_action": needs_action})
-    dump_yaml(os.path.join(rd, "orchestrator", "inbox.yaml"), inbox)
+    _inbox_path = os.path.join(rd, "orchestrator", "inbox.yaml")
+    if Channel is not None:
+        # v2: route through the shared Channel (atomic, idempotent-capable). Preserves the {items:[...]}
+        # shape + every existing key; adds envelope fields (id/submitted_at/...) which readers ignore.
+        Channel(_inbox_path, list_key="items", id_prefix="IN").submit({**rec, "needs_action": needs_action})
+    else:
+        inbox = load_yaml(_inbox_path, {"items": []}) or {"items": []}
+        inbox["items"].append({**rec, "acked": False, "needs_action": needs_action})
+        dump_yaml(_inbox_path, inbox)
     # bump heartbeat too (a report IS liveness)
     hp = os.path.join(rd, "agents", f"{args.agent}.yaml"); hb = load_yaml(hp, {}) or {}
     hb.update({"agent_id": args.agent, "last_heartbeat": NOW(), "status": "running",
@@ -476,14 +490,19 @@ def cmd_inbox(args):
     """ORCHESTRATOR reads pending researcher reports. --action-only shows just blocks/questions.
     This is what prevents the orchestrator from sitting idle: it polls progress + acts on needs."""
     root = inst_root(args); rd = runtime_dir(root)
-    inbox = load_yaml(os.path.join(rd, "orchestrator", "inbox.yaml"), {"items": []}) or {"items": []}
-    items = [i for i in inbox["items"] if not i.get("acked")]
-    if args.action_only: items = [i for i in items if i.get("needs_action")]
+    _inbox_path = os.path.join(rd, "orchestrator", "inbox.yaml")
+    if Channel is not None:
+        pred = (lambda i: i.get("needs_action")) if args.action_only else None
+        items = Channel(_inbox_path, list_key="items", id_prefix="IN").list(predicate=pred)
+    else:
+        inbox = load_yaml(_inbox_path, {"items": []}) or {"items": []}
+        items = [i for i in inbox["items"] if not i.get("acked")]
+        if args.action_only: items = [i for i in items if i.get("needs_action")]
     if not items: print("(inbox empty — no pending reports)"); return
     print(f"ORCHESTRATOR INBOX — {len(items)} pending:")
     for i in items:
         tag = "❗ACTION" if i.get("needs_action") else "  info "
-        print(f"  [{tag}] {i['ts']} {i['agent']} [{i.get('role','')}]")
+        print(f"  [{tag}] {i.get('ts','')} {i.get('agent','')} [{i.get('role','')}]")
         if i.get("done"):    print(f"          done:    {i['done']}")
         if i.get("doing"):   print(f"          doing:   {i['doing']}")
         if i.get("blocked"): print(f"          BLOCKED: {i['blocked']}")
@@ -493,12 +512,16 @@ def cmd_inbox(args):
 def cmd_inbox_ack(args):
     root = inst_root(args); rd = runtime_dir(root)
     p = os.path.join(rd, "orchestrator", "inbox.yaml")
-    inbox = load_yaml(p, {"items": []}) or {"items": []}
-    n = 0
-    for i in inbox["items"]:
-        if not i.get("acked") and (args.all or i.get("agent") == args.agent):
-            i["acked"] = True; i["acked_at"] = NOW(); i["answer"] = args.answer or ""; n += 1
-    dump_yaml(p, inbox)
+    if Channel is not None and args.all:
+        n = Channel(p, list_key="items", id_prefix="IN").ack(all_items=True, answer=args.answer or "")
+    else:
+        # per-agent ack: Channel.ack keys on item id, not agent; keep the explicit loop for the agent filter.
+        inbox = load_yaml(p, {"items": []}) or {"items": []}
+        n = 0
+        for i in inbox["items"]:
+            if not i.get("acked") and (args.all or i.get("agent") == args.agent):
+                i["acked"] = True; i["acked_at"] = NOW(); i["answer"] = args.answer or ""; n += 1
+        dump_yaml(p, inbox)
     print(f"✅ acked {n} inbox item(s)" + (f" with answer: {args.answer}" if args.answer else ""))
 
 def cmd_reports_age(args):
@@ -879,6 +902,9 @@ def cmd_resume(args):
 def _queue_path(root):
     return os.path.join(runtime_dir(root), "orchestrator", "committee_queue.yaml")
 
+def _committee_channel(root):
+    return Channel(_queue_path(root), list_key="queue", id_prefix="Q")
+
 def cmd_queue_submit(args):
     """SUB-MONITOR pushes a committee-submission request for a researcher proposal that is ready for review.
     The orchestrator pulls these (`ros queue list`) and convenes the committee. Decouples researcher mgmt
@@ -893,33 +919,50 @@ def cmd_queue_submit(args):
     for eid in exp_ids:
         if not glob.glob(os.path.join(root, "experiments", "**", eid, "experiment.yaml"), recursive=True):
             sys.exit(f"❌ experiment {eid} not found — a submission must cite real EXP evidence.")
-    q = load_yaml(_queue_path(root), {"queue": []}) or {"queue": []}
-    qid = f"Q-{len(q['queue'])+1:04d}"
-    # idempotency: don't double-submit the same (claim, exp-set) while still pending
-    for it in q["queue"]:
-        if (not it.get("acked") and it.get("claim_id") == args.claim
-                and sorted(it.get("experiment_ids") or []) == sorted(exp_ids)):
-            print(f"↩︎ already queued as {it.get('queue_id')} (claim {args.claim}, exps {exp_ids}) — not duplicating.")
-            return
-    rec = {"queue_id": qid, "claim_id": args.claim, "project_id": args.project or "",
-           "experiment_ids": exp_ids, "submitted_by": args.by or "", "researcher": args.researcher or "",
-           "kind": args.kind or "committee", "summary": args.summary or "", "priority": args.priority or 0,
-           "submitted_at": NOW(), "acked": False, "acked_by": "", "acked_at": "", "answer": ""}
-    q["queue"].append(rec); dump_yaml(_queue_path(root), q)
-    print(f"✅ {qid} submitted to orchestrator committee-queue (claim {args.claim}, kind={rec['kind']}, "
-          f"exps={exp_ids or '—'}, by={rec['submitted_by'] or '?'})")
+    payload = {"claim_id": args.claim, "project_id": args.project or "",
+               "experiment_ids": exp_ids, "submitted_by": args.by or "", "researcher": args.researcher or "",
+               "kind": args.kind or "committee", "summary": args.summary or "", "priority": args.priority or 0}
+    if Channel is not None:
+        ch = _committee_channel(root)
+        r = ch.submit(payload, dedup_keys=["claim_id", "experiment_ids"])
+        # mirror Channel's id into queue_id for back-compat readers/printers
+        if r.get("dup"):
+            print(f"↩︎ already queued as {r['id']} (claim {args.claim}, exps {exp_ids}) — not duplicating."); return
+        # mirror the channel id into queue_id for back-compat readers/printers
+        d = ch._read()
+        for it in d["queue"]:
+            if it.get("id") == r["id"]: it["queue_id"] = r["id"]
+        from channeling.channel import _dump as _chan_dump
+        _chan_dump(ch.path, d)
+        qid = r["id"]
+    else:
+        q = load_yaml(_queue_path(root), {"queue": []}) or {"queue": []}
+        qid = f"Q-{len(q['queue'])+1:04d}"
+        for it in q["queue"]:
+            if (not it.get("acked") and it.get("claim_id") == args.claim
+                    and sorted(it.get("experiment_ids") or []) == sorted(exp_ids)):
+                print(f"↩︎ already queued as {it.get('queue_id')} (claim {args.claim}, exps {exp_ids}) — not duplicating.")
+                return
+        rec = {"queue_id": qid, **payload, "submitted_at": NOW(), "acked": False, "acked_by": "", "acked_at": "", "answer": ""}
+        q["queue"].append(rec); dump_yaml(_queue_path(root), q)
+    print(f"✅ {qid} submitted to orchestrator committee-queue (claim {args.claim}, kind={payload['kind']}, "
+          f"exps={exp_ids or '—'}, by={payload['submitted_by'] or '?'})")
 
 def cmd_queue_list(args):
     """ORCHESTRATOR pulls pending committee-submission requests from the sub-monitors. This is the
     decoupled replacement for poking researchers: the orchestrator acts only on queued, vetted submissions."""
     root = inst_root(args)
-    q = load_yaml(_queue_path(root), {"queue": []}) or {"queue": []}
-    items = [i for i in q["queue"] if (args.all or not i.get("acked"))]
+    if Channel is not None:
+        items = _committee_channel(root).list(include_acked=args.all)
+    else:
+        q = load_yaml(_queue_path(root), {"queue": []}) or {"queue": []}
+        items = [i for i in q["queue"] if (args.all or not i.get("acked"))]
     if not items: print("(committee-queue empty — no pending submissions)"); return
     print(f"COMMITTEE QUEUE — {len(items)} {'total' if args.all else 'pending'}:")
     for i in sorted(items, key=lambda x: -x.get("priority", 0)):
+        qid = i.get("queue_id") or i.get("id")
         tag = "✓acked" if i.get("acked") else "⏳PENDING"
-        print(f"  [{tag}] {i['queue_id']} {i.get('submitted_at','')} claim={i.get('claim_id')} "
+        print(f"  [{tag}] {qid} {i.get('submitted_at','')} claim={i.get('claim_id')} "
               f"({i.get('project_id') or '?'}) kind={i.get('kind')}")
         if i.get("researcher"): print(f"          researcher: {i['researcher']}  (via {i.get('submitted_by','?')})")
         if i.get("experiment_ids"): print(f"          cites: {', '.join(i['experiment_ids'])}")
@@ -929,13 +972,25 @@ def cmd_queue_list(args):
 def cmd_queue_ack(args):
     """ORCHESTRATOR marks a submission consumed (committee convened / deferred / rejected, with a reason)."""
     root = inst_root(args); p = _queue_path(root)
-    q = load_yaml(p, {"queue": []}) or {"queue": []}
-    n = 0
-    for i in q["queue"]:
-        if not i.get("acked") and (args.all or i.get("queue_id") == args.id):
-            i["acked"] = True; i["acked_at"] = NOW(); i["acked_by"] = args.by or "orchestrator"
-            i["answer"] = args.answer or ""; n += 1
-    dump_yaml(p, q)
+    if Channel is not None:
+        ch = _committee_channel(root)
+        # Channel.ack keys on native id; queue_id == id for v2-created items.
+        n = ch.ack(item_id=args.id, all_items=bool(args.all), by=args.by or "orchestrator", answer=args.answer or "")
+        # back-compat: also ack legacy items whose queue_id matches but lack a native id
+        if not args.all and n == 0:
+            d = ch._read(); 
+            for i in d["queue"]:
+                if not i.get("acked") and i.get("queue_id") == args.id:
+                    i["acked"] = True; i["acked_at"] = NOW(); i["acked_by"] = args.by or "orchestrator"; i["answer"] = args.answer or ""; n += 1
+            dump_yaml(p, d)
+    else:
+        q = load_yaml(p, {"queue": []}) or {"queue": []}
+        n = 0
+        for i in q["queue"]:
+            if not i.get("acked") and (args.all or i.get("queue_id") == args.id):
+                i["acked"] = True; i["acked_at"] = NOW(); i["acked_by"] = args.by or "orchestrator"
+                i["answer"] = args.answer or ""; n += 1
+        dump_yaml(p, q)
     print(f"✅ acked {n} queue item(s)" + (f": {args.answer}" if args.answer else ""))
 
 
