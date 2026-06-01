@@ -676,7 +676,11 @@ def cmd_submonitors(args):
     liv = cfg.get("liveness", {}) or {}
     kick = int(liv.get("kick_interval_minutes", 15)); grace = int(liv.get("patient_grace_minutes", 45))
     now = _dt.datetime.now(_dt.timezone.utc)
-    projects = sorted(os.path.basename(p) for p in glob.glob(os.path.join(root, "projects", "PROJ-*")))
+    all_projects = sorted(glob.glob(os.path.join(root, "projects", "PROJ-*")))
+    # CONVERGED projects (arc closed, .converged marker / status) need NO sub-monitor — exclude them from
+    # the discovery list so they don't show as false "needs respawn". Only ACTIVE projects require coverage.
+    converged_pids = [os.path.basename(p) for p in all_projects if _is_converged_project(p)]
+    projects = [os.path.basename(p) for p in all_projects if not _is_converged_project(p)]
     # index sub-monitor agents by project (role==sub-monitor or 'sub-monitor'/'submonitor' in the id)
     sm_by_proj = {}
     for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
@@ -694,7 +698,8 @@ def cmd_submonitors(args):
             if cur is None or age < cur["age"]:
                 sm_by_proj[pid] = {"id": aid, "status": a.get("status","?"), "age": round(age,1)}
     need = []
-    print(f"SUB-MONITOR DISCOVERY (kick={kick}m, grace={grace}m) — {len(projects)} active project(s):")
+    print(f"SUB-MONITOR DISCOVERY (kick={kick}m, grace={grace}m) — {len(projects)} active project(s)"
+          + (f"; {len(converged_pids)} converged (no sub-monitor needed): {', '.join(converged_pids)}" if converged_pids else "") + ":")
     for pid in projects:
         sm = sm_by_proj.get(pid)
         if not sm:
