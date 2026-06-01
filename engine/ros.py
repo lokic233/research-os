@@ -604,12 +604,40 @@ def cmd_reports_age(args):
         print(f"✅ all researchers reported within {win}m")
 
 
+def _concurrent_invest_target(cfg):
+    """GLOBAL concurrent-investment target: how many projects should be ACTIVELY investing at once.
+    When the investing count drops below this (a project converges), the orchestrator designs a new
+    project to refill to target. Prefer globals.concurrent_invest_projects; default 4."""
+    g = (cfg.get("globals") or {}).get("concurrent_invest_projects")
+    if g is not None:
+        try: return int(g)
+        except Exception: pass
+    return 4
+
+def _is_converged_project(d):
+    """A project is CONVERGED (not counted toward the investing target) if it carries an explicit
+    marker: a projects/<PROJ>/.converged file, OR `status: converged|closed|done` in its
+    project_overview.md front-matter/first lines. Converged projects keep their folder (history is
+    preserved) but free a slot so the orchestrator designs a replacement frontier."""
+    if os.path.exists(os.path.join(d, ".converged")): return True
+    ov = os.path.join(d, "project_overview.md")
+    if os.path.exists(ov):
+        try:
+            with open(ov) as f:
+                head = "".join(f.readline() for _ in range(12))
+        except Exception:
+            head = ""
+        import re as _re
+        if _re.search(r'(?im)^\s*status\s*:\s*(converged|closed|done|finalized)\b', head): return True
+    return False
+
 def cmd_projects(args):
     root=inst_root(args)
     pdir=os.path.join(root,"projects")
     found=sorted(glob.glob(os.path.join(pdir,"PROJ-*")))
     if not found: print("(no projects — create projects/<PROJ-id>/project_overview.md)"); return
     print(f"projects ({len(found)}):")
+    investing=0; converged=[]
     for d in found:
         pid=os.path.basename(d)
         ov=os.path.join(d,"project_overview.md")
@@ -619,7 +647,19 @@ def cmd_projects(args):
                 if ln.startswith("# "): title=ln[2:].strip(); break
         reports=sorted(glob.glob(os.path.join(d,"*","progress_report.md")))
         last=os.path.basename(os.path.dirname(reports[-1])) if reports else "no report"
-        print(f"  {pid}: {title}  (latest progress: {last})")
+        conv=_is_converged_project(d)
+        if conv: converged.append(pid)
+        else: investing+=1
+        flag=" 🏁 CONVERGED" if conv else ""
+        print(f"  {pid}: {title}  (latest progress: {last}){flag}")
+    # GLOBAL concurrent-investment capacity signal (orchestrator refills to target by designing new projects)
+    cfg=_cfg(root); target=_concurrent_invest_target(cfg)
+    print(f"\nCONCURRENT INVESTMENT: {investing} investing / target {target}"
+          + (f"  (converged: {', '.join(converged)})" if converged else ""))
+    if investing < target:
+        deficit=target-investing
+        print(f"⚠️ BELOW TARGET by {deficit} — ORCHESTRATOR must DESIGN {deficit} new project(s) "
+              f"(honest committee, bias agent-infra/inference-opt) and seed each to refill to {target}.")
 
 
 def cmd_submonitors(args):
