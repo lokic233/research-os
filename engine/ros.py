@@ -371,6 +371,38 @@ def cmd_env_discover(args):
     if args.probe: 
         for n in nodes: print(f"     - {n.get('name','?')}: {n.get('status')}")
 
+def _gpu_window_open(root):
+    """Time-boxed GPU AUTO-APPROVE window (operator opt-in). When open, GPU exps may enter the queue/dispatch
+    WITHOUT a committee_approved verdict (the committee scientific gate is waived for the window). The fragile-
+    node host_mem_floor watchdog is NEVER waived (hardware safety, not a gate). Returns (open:bool, until:str)."""
+    import datetime as _d
+    p = os.path.join(runtime_dir(root), "gpu_approve_window.yaml")
+    w = load_yaml(p, {}) or {}
+    until = w.get("until", "")
+    if not until:
+        return (False, "")
+    try:
+        exp = _d.datetime.strptime(until, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_d.timezone.utc)
+        return ((_d.datetime.now(_d.timezone.utc) <= exp), until)
+    except Exception:
+        return (False, until)
+
+def cmd_gpu_approve_window(args):
+    """Operator: open/close a time-boxed GPU auto-approve window. `--hours N` opens for N hours from now;
+    `--clear` closes it. While open, GPU exps need NO committee_approved to queue/dispatch (host_mem_floor
+    safety still enforced). Logs the operator intent."""
+    import datetime as _d
+    p = os.path.join(runtime_dir(root := inst_root(args)), "gpu_approve_window.yaml")
+    if args.clear:
+        dump_yaml(p, {"until": "", "set_at": NOW(), "set_by": args.by or "operator", "note": "CLEARED"})
+        print("✅ GPU auto-approve window CLOSED."); return
+    hours = args.hours if args.hours else 24
+    until = (_d.datetime.now(_d.timezone.utc) + _d.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    dump_yaml(p, {"until": until, "set_at": NOW(), "set_by": args.by or "operator", "hours": hours,
+                  "note": args.note or "all GPU exps auto-approved for the window (host_mem_floor still enforced)"})
+    print(f"✅ GPU AUTO-APPROVE window OPEN for {hours}h — until {until} UTC.")
+    print(f"   GPU exps may queue/dispatch WITHOUT committee_approved until then. Fragile-node host_mem_floor still REQUIRED.")
+
 def cmd_agent_register(args):
     root = inst_root(args); rd = runtime_dir(root)
     d = os.path.join(rd, "agents"); os.makedirs(d, exist_ok=True)
@@ -454,10 +486,14 @@ def cmd_exp_dispatch(args):
         sys.exit(f"❌ SAFETY: node '{args.node}' is fragile and exp {args.exp} has no host_mem_floor_gb. "
                  f"Re-register with --host-mem-floor (watchdog) before dispatch. (See learning/ postmortems.)")
     lvl = exp.get("level", 0)
-    # FULLY AUTONOMOUS (no human gate). A GPU exp must be COMMITTEE-APPROVED to be dispatchable.
-    if not (exp.get("committee_approved") or args.force):
+    # FULLY AUTONOMOUS (no human gate). A GPU exp must be COMMITTEE-APPROVED to be dispatchable —
+    # UNLESS the operator opened a time-boxed GPU auto-approve window (then the committee gate is waived).
+    _win, _until = _gpu_window_open(inst_root(args))
+    if not (exp.get("committee_approved") or args.force or _win):
         sys.exit(f"❌ {args.exp} not committee_approved — enqueue via `ros gpu queue` only after a committee "
-                 f"verdict approves the experiment (or --force for an explicit override).")
+                 f"verdict approves the experiment (or --force, or open a window: ros gpu-approve-window --hours N).")
+    if _win and not exp.get("committee_approved"):
+        print(f"   ⏱️ GPU auto-approve window OPEN (until {_until}) — committee gate waived for {args.exp}.")
     exp["status"] = "running"; exp["started_at"] = NOW()
     exp["dispatched_by"] = args.by or "orchestrator"
     exp["node_lease"] = f"{args.node}:{exp.get('exp_id')}"
@@ -787,8 +823,10 @@ def cmd_gpu_queue(args):
     hits=glob.glob(os.path.join(root,"experiments","**",args.exp,"experiment.yaml"),recursive=True)
     ef=hits[0] if hits else None; exp=load_yaml(ef) if ef else None
     if not exp: sys.exit(f"❌ {args.exp} not found.")
-    if not (exp.get("committee_approved") or args.force):
-        sys.exit(f"❌ {args.exp} is not committee_approved — only committee-greenlit experiments enter the GPU queue (--force to override).")
+    _win,_until=_gpu_window_open(inst_root(args))
+    if not (exp.get("committee_approved") or args.force or _win):
+        sys.exit(f"❌ {args.exp} is not committee_approved — only committee-greenlit experiments enter the GPU queue (--force, or ros gpu-approve-window --hours N).")
+    if _win and not exp.get("committee_approved"): print(f"   ⏱️ GPU auto-approve window OPEN (until {_until}) — committee gate waived for {args.exp}.")
     floor=(exp.get("resource_budget") or {}).get("host_mem_floor_gb",0) or 0
     q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
     if any(i.get("exp_id")==args.exp for i in q["queue"]): print(f"already queued: {args.exp}"); return
@@ -964,9 +1002,11 @@ def cmd_gpu_task_submit(args):
     hits = glob.glob(os.path.join(root, "experiments", "**", args.exp, "experiment.yaml"), recursive=True)
     ef = hits[0] if hits else None; exp = load_yaml(ef) if ef else None
     if not exp: sys.exit(f"❌ {args.exp} not found.")
-    if not (exp.get("committee_approved") or args.force):
+    _win,_until=_gpu_window_open(inst_root(args))
+    if not (exp.get("committee_approved") or args.force or _win):
         sys.exit(f"❌ {args.exp} is not committee_approved — only committee-greenlit experiments enter the GPU "
-                 f"task channel (--force to override).")
+                 f"task channel (--force, or open a window: ros gpu-approve-window --hours N).")
+    if _win and not exp.get("committee_approved"): print(f"   ⏱️ GPU auto-approve window OPEN (until {_until}) — committee gate waived for {args.exp}.")
     floor = int(args.host_mem_floor if args.host_mem_floor is not None
                 else (exp.get("resource_budget") or {}).get("host_mem_floor_gb", 0) or 0)
     gt = args.gpu_type or "any"
@@ -1349,6 +1389,11 @@ def main():
     sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
     sub.add_parser("submonitors").set_defaults(fn=cmd_submonitors)
     sub.add_parser("coordinators").set_defaults(fn=cmd_coordinators)
+    gaw = sub.add_parser("gpu-approve-window")
+    gaw.add_argument("--hours", type=float, help="open the auto-approve window for N hours (default 24)")
+    gaw.add_argument("--clear", action="store_true", help="close the window now")
+    gaw.add_argument("--by"); gaw.add_argument("--note")
+    gaw.set_defaults(fn=cmd_gpu_approve_window)
     rp = sub.add_parser("report")
     rp.add_argument("--agent", required=True); rp.add_argument("--role")
     rp.add_argument("--done"); rp.add_argument("--doing"); rp.add_argument("--blocked")
