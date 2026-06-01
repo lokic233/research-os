@@ -1,0 +1,80 @@
+<!doctype html><html><head><meta charset=utf-8>
+<title>research-os ops dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+body{font-family:ui-sans-serif,system-ui,Arial;margin:0;background:#0b0e14;color:#e6edf3}
+h1{font-size:17px;padding:13px 18px;margin:0;border-bottom:1px solid #1f2530;background:#11151d}
+h2{font-size:14px;color:#8b949e;margin:18px 16px 6px;text-transform:uppercase;letter-spacing:.5px}
+.kpis{display:flex;flex-wrap:wrap;gap:10px;padding:12px 16px}
+.kpi{background:#11151d;border:1px solid #1f2530;border-radius:10px;padding:9px 13px;min-width:108px}
+.kpi b{font-size:21px;display:block}.kpi span{color:#8b949e;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;padding:8px 16px}
+.card{background:#11151d;border:1px solid #1f2530;border-radius:10px;padding:12px}
+.warn{color:#f0883e}.bad{color:#f85149}.ok{color:#3fb950}
+#bn div{padding:4px 0;border-bottom:1px solid #1f2530}small{color:#8b949e}
+canvas{max-height:230px}
+</style></head><body>
+<h1>research-os — operational dashboard <small id=ts></small></h1>
+<div class=kpis id=kpis></div>
+<h2>Instance (shared committee + GPU)</h2>
+<div class=grid>
+<div class=card><canvas id=cProduce></canvas></div>
+<div class=card><canvas id=cExp></canvas></div>
+<div class=card><canvas id=cCommittee></canvas></div>
+<div class=card><canvas id=cGpu></canvas></div>
+</div>
+<h2>Per-project</h2>
+<div class=grid>
+<div class=card><canvas id=pClaims></canvas></div>
+<div class=card><canvas id=pVerdicts></canvas></div>
+<div class=card><canvas id=pExp></canvas></div>
+<div class=card><canvas id=pGreen></canvas></div>
+</div>
+<div class=card style="margin:0 16px 16px"><b>Bottleneck signals</b><div id=bn></div></div>
+<script>
+const D=__DATA__;
+const I=D.instance||[]; const P=D.projects||{};
+const last=I.length?I[I.length-1]:{}; const prev=I.length>1?I[I.length-2]:{};
+const pids=Object.keys(P).sort();
+document.getElementById('ts').textContent=last.ts?('· '+last.ts+' · '+I.length+' snapshots · '+pids.length+' projects'):'(no data yet)';
+const lab=I.map(r=>(r.ts||'').slice(5,16));
+const COL=['#58a6ff','#3fb950','#f0883e','#bc8cff','#f85149','#56d4dd'];
+function kpi(l,v,c){return '<div class=kpi><b class="'+(c||'')+'">'+v+'</b><span>'+l+'</span></div>';}
+const gpuIdle=(last.gpu_leases_active||0)===0;
+document.getElementById('kpis').innerHTML=[
+ kpi('claims',last.claims||0),kpi('verdicts',last.verdicts||0),
+ kpi('GREEN',last.verdict_green||0,'ok'),kpi('cemetery',last.cemetery||0),
+ kpi('experiments',last.experiments_total||0),
+ kpi('CPU / GPU exp',(last.cpu_exp||0)+' / '+(last.gpu_exp||0)),
+ kpi('committee done',last.committee_done||0,'ok'),
+ kpi('committee incomplete',last.committee_incomplete||0,(last.committee_incomplete>0?'bad':'')),
+ kpi('GPU leases',last.gpu_leases_active||0,(gpuIdle?'warn':'ok')),
+ kpi('GPU queue',last.gpu_queue_len||0)
+].join('');
+function line(id,labels,ds){new Chart(document.getElementById(id),{type:'line',
+ data:{labels:labels,datasets:ds.map(s=>({label:s.l,data:s.d,borderColor:s.c,backgroundColor:s.c,tension:.25,fill:false,pointRadius:1}))},
+ options:{plugins:{title:{display:true,text:id,color:'#e6edf3'},legend:{labels:{color:'#8b949e',boxWidth:12}}},
+  scales:{x:{ticks:{color:'#8b949e',maxTicksLimit:7}},y:{ticks:{color:'#8b949e'},beginAtZero:true}}}});}
+// instance charts
+line('produce',lab,[{l:'claims',d:I.map(r=>r.claims),c:COL[0]},{l:'verdicts',d:I.map(r=>r.verdicts),c:COL[1]},{l:'cemetery',d:I.map(r=>r.cemetery),c:'#8b949e'}]);
+line('exp',lab,[{l:'CPU exp',d:I.map(r=>r.cpu_exp),c:COL[0]},{l:'GPU exp',d:I.map(r=>r.gpu_exp),c:COL[2]},{l:'completed',d:I.map(r=>r.exp_completed),c:COL[1]}]);
+line('committee',lab,[{l:'done',d:I.map(r=>r.committee_done),c:COL[1]},{l:'incomplete',d:I.map(r=>r.committee_incomplete),c:COL[4]}]);
+line('gpu',lab,[{l:'GPU leases',d:I.map(r=>r.gpu_leases_active),c:COL[2]},{l:'GPU queue',d:I.map(r=>r.gpu_queue_len),c:COL[0]},{l:'GPU exp',d:I.map(r=>r.gpu_exp),c:COL[1]}]);
+// per-project charts (one dataset per project)
+function perProj(id,field){const pl=(P[pids[0]]||[]).map(r=>(r.ts||'').slice(5,16));
+ line(id,pl,pids.map((p,i)=>({l:p,d:(P[p]||[]).map(r=>r[field]),c:COL[i%COL.length]})));}
+perProj('pClaims','claims'); perProj('pVerdicts','verdicts'); perProj('pExp','experiments_total'); perProj('pGreen','verdict_green');
+// bottleneck heuristics
+const bn=[];
+if((last.gpu_leases_active||0)===0 && (last.gpu_queue_len||0)===0) bn.push(['warn','GPU IDLE: 0 leases + empty queue — H100 capacity unused. Queue a committee-approved serving exp or accept CPU-bound phase.']);
+if((last.committee_incomplete||0)>0) bn.push(['bad','COMMITTEE_INCOMPLETE='+last.committee_incomplete+' — runner dropped members; re-run, never count.']);
+if(I.length>1 && (last.claims||0)===(prev.claims||0) && (last.verdicts||0)===(prev.verdicts||0)) bn.push(['warn','STALL: no new claims/verdicts since previous snapshot — throughput flat.']);
+const ratio=last.experiments_total?((last.gpu_exp||0)/last.experiments_total*100).toFixed(0):0;
+const gr=last.verdicts?((last.verdict_green||0)/last.verdicts*100).toFixed(0):0;
+bn.push(['ok','GPU-exp share '+ratio+'% · GREEN-verdict rate '+gr+'% ('+ (last.verdict_green||0)+'/'+(last.verdicts||0)+'). CPU research is cheap+parallel; reserve GPU for serving/throughput cells.']);
+// per-project imbalance
+let mn=1e9,mx=-1,mnp='',mxp='';
+pids.forEach(p=>{const s=(P[p]||[]).slice(-1)[0]||{};const c=s.claims||0;if(c<mn){mn=c;mnp=p}if(c>mx){mx=c;mxp=p}});
+if(pids.length>1 && mx-mn>=4) bn.push(['warn','PROJECT IMBALANCE: '+mxp+' has '+mx+' claims vs '+mnp+' '+mn+' — rebalance researcher lanes toward '+mnp+'.']);
+document.getElementById('bn').innerHTML=bn.map(x=>'<div class="'+x[0]+'">'+x[1]+'</div>').join('');
+</script></body></html>
