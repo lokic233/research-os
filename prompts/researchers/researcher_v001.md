@@ -30,12 +30,21 @@ lane; do not depend on another researcher to hand you work.
 A heartbeat says "alive"; a REPORT says "here's what I produced + what I need." Silence = orchestrator idle.
 Register on spawn (`ros agent register --id <id> --role researcher`) and run a heartbeat/report sub-agent.
 
-## On finish: WAKE THE ORCHESTRATOR (do not just stop)
-When you complete (or hit a blocker needing a decision), the orchestrator may be idle waiting on you. After
-your final `ros report ... --done`, PING THE ORCHESTRATOR (the hub) — agent_run.message to the ORCHESTRATOR
-SESSION ID that the orchestrator gave you at spawn (NOT the human, NOT the observer/monitor) with a one-line
-"EXP-<id> done, effect=<x>, CLAIM-<id> ready — resume." A new_session researcher does NOT auto-announce; you
-must ping the orchestrator. Results always flow back to the orchestrator; the observer only watches.
+## On finish: SELF-COMPLETE with an explicit terminal status (do NOT exit silently)
+A researcher that just stops looks DEAD to liveness → it gets blindly respawned into make-work. NEVER exit
+silently. When your lane is done (or you early-kill, or you hit a hard blocker), CLOSE THE LIFECYCLE:
+1. Final `ros report --agent <your-id> --role researcher --done "<what you produced>" --next "<follow-on work
+   for this project, or NONE if the lane is exhausted>"`. The `--next` field is the WORK SIGNAL the sub-monitor
+   uses to decide whether to refill: a concrete follow-on → it spawns the next lane; "NONE / exhausted /
+   blocked-on-human" → it does NOT refill (no make-work).
+2. Set your TERMINAL STATUS so liveness retires you (not "running" → DEAD → respawn):
+   `ros heartbeat --agent <your-id> --status completed` (lane delivered) — or `--status failed` if you crashed
+   out, so the sub-monitor investigates the cause instead of blind-respawning. (Engine treats
+   completed/failed/retired as 🏁 retired, never DEAD-revival-eligible.)
+3. Report to YOUR SUB-MONITOR (it owns your project's health + the committee-submission queue), NOT the
+   orchestrator: if your evidence is committee-ready, your `ros report --done` is the sub-monitor's cue to
+   `ros queue submit` it. Then STOP. The sub-monitor handles refill (work-gated) + submission; the orchestrator
+   only health-checks the sub-monitor. (DEPRECATED: pinging the orchestrator directly.)
 
 ## EARLY-KILL ORIENTATION (do this BEFORE proposing/experimenting — saves cycles)
 On spawn, READ — for YOUR assigned project — in this order:

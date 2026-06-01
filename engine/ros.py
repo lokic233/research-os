@@ -359,7 +359,7 @@ def cmd_agent_register(args):
            "node": args.node or "", "status": "running", "spawned_at": NOW(),
            "last_heartbeat": NOW(), "current_claim_id": args.claim or "", "current_exp_id": args.exp or "",
            "project_id": getattr(args, "project", "") or "", "session_id": getattr(args, "session", "") or "",
-           "note": "", "heartbeat_count": 0}
+           "gpu": getattr(args, "gpu", "") or "", "note": "", "heartbeat_count": 0}
     dump_yaml(os.path.join(d, f"{args.id}.yaml"), rec)
     print(f"✅ agent {args.id} registered (role={args.role}). Heartbeat: `ros heartbeat --agent {args.id}` every ~{(_cfg(root).get('liveness') or {}).get('kick_interval_minutes',15)}m")
 
@@ -381,6 +381,7 @@ def cmd_heartbeat(args):
     if args.exp: rec["current_exp_id"] = args.exp
     if getattr(args, "project", None): rec["project_id"] = args.project
     if getattr(args, "session", None): rec["session_id"] = args.session
+    if getattr(args, "gpu", None): rec["gpu"] = args.gpu
     dump_yaml(p, rec)
     print(f"💓 {args.agent} heartbeat #{rec['heartbeat_count']} ({rec.get('status','?')})")
 
@@ -648,6 +649,79 @@ def _had_handoff(rd, agent_id):
     except Exception:
         pass
     return False
+
+def _retire_pct(cfg):
+    """GLOBAL retire-and-respawn context threshold for all long-running/standby agents (orchestrator,
+    sub-monitor, gpu_coordinator). Prefer globals.retire_at_context_pct; fall back to
+    research.sub_monitor.retire_at_context_pct; default 35."""
+    g = (cfg.get("globals") or {}).get("retire_at_context_pct")
+    if g is not None: return int(g)
+    sm = ((cfg.get("research") or {}).get("sub_monitor") or {}).get("retire_at_context_pct")
+    return int(sm) if sm is not None else 35
+
+def cmd_coordinators(args):
+    """GPU-COORDINATOR DISCOVERY + health (ORCHESTRATOR duty). Mirror of `ros submonitors` but for the
+    role==gpu_coordinator one-per-GPU-backend invariant: enumerate every config compute_node with kind==gpu
+    and verify each has a LIVE coordinator (matched by gpu_type via the agent's `gpu` tag or _infer). Any
+    GPU whose coordinator is MISSING / DEAD / retired-without-successor must get one (re)spawned by the
+    ORCHESTRATOR — a dead coordinator cannot respawn itself (esp. context-overflow before handoff). Exit
+    non-zero if any GPU needs action, so a wrapper/cron can branch on it."""
+    import datetime as _dt
+    root = inst_root(args); rd = runtime_dir(root); cfg = _cfg(root)
+    liv = cfg.get("liveness", {}) or {}
+    kick = int(liv.get("kick_interval_minutes", 15)); grace = int(liv.get("patient_grace_minutes", 45))
+    now = _dt.datetime.now(_dt.timezone.utc)
+    gpus = [n for n in (cfg.get("compute_nodes") or []) if n.get("kind") == "gpu"]
+    # index gpu_coordinator agents by gpu_type (role==gpu_coordinator or 'gpu_coordinator'/'coordinator' in id)
+    coord_by_gpu = {}
+    for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
+        a = load_yaml(fn, {}) or {}
+        aid = a.get("agent_id", ""); role = a.get("role", "")
+        if not (role == "gpu_coordinator" or "gpu_coordinator" in aid or "gpu-coordinator" in aid):
+            continue
+        try:
+            last = _dt.datetime.strptime(a.get("last_heartbeat",""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+            age = (now - last).total_seconds() / 60.0
+        except Exception:
+            age = 1e9
+        # key on the agent's gpu_type tag; fall back to inferring from node or id
+        gpu = a.get("gpu", "") or a.get("node", "") or _infer_gpu_from_id(aid)
+        cur = coord_by_gpu.get(gpu)
+        if cur is None or age < cur["age"]:
+            coord_by_gpu[gpu] = {"id": aid, "status": a.get("status","?"), "age": round(age,1)}
+    need = []
+    print(f"GPU-COORDINATOR DISCOVERY (kick={kick}m, grace={grace}m) — {len(gpus)} GPU backend(s):")
+    for n in gpus:
+        gt = n.get("gpu_type", ""); node = n.get("name", "")
+        # a coordinator matches this GPU by gpu_type tag OR by the node name (tolerant)
+        c = coord_by_gpu.get(gt) or coord_by_gpu.get(node)
+        label = f"{node}/{gt}"
+        if not c:
+            print(f"  ❌ {label}: NO gpu_coordinator — orchestrator must spawn one."); need.append((label,"missing")); continue
+        st = c["status"]; age = c["age"]
+        if st in ("completed","retired"):
+            print(f"  🏁 {label}: {c['id']} retired (last {age}m) — verify a successor exists; if not, respawn.")
+            need.append((label,"retired-no-successor"))
+        elif st == "failed" or age > grace:
+            handed = _had_handoff(rd, c["id"])
+            tag = "DEAD" if age > grace else "failed"
+            extra = "" if handed else " (NO handoff audit — likely context overflow; orchestrator owns respawn)"
+            print(f"  ☠️ {label}: {c['id']} {tag} last={age}m{extra} — orchestrator MUST spawn a replacement.")
+            need.append((label,"dead"))
+        elif age > kick*1.5:
+            print(f"  ⏳ {label}: {c['id']} STALE last={age}m (within grace) — watch; respawn if it crosses {grace}m.")
+        else:
+            print(f"  💓 {label}: {c['id']} alive last={age}m.")
+    if need:
+        print(f"\n⚠️ {len(need)} GPU(s) need a gpu_coordinator (re)spawn by the ORCHESTRATOR:")
+        for label, why in need: print(f"   - {label}: {why}")
+        sys.exit(3)
+    print("\n✅ every GPU backend has a live gpu_coordinator.")
+
+def _infer_gpu_from_id(aid):
+    for gt in ("H100","MI350X","A100","H200","MI300X"):
+        if gt.lower() in (aid or "").lower(): return gt
+    return ""
 
 def cmd_exp_gc(args):
     """BUG-23: retire orphan pending experiments (registered but never completed) + clear their dangling
@@ -1246,14 +1320,16 @@ def main():
     agr.add_argument("--id", required=True); agr.add_argument("--role", required=True)
     agr.add_argument("--backend"); agr.add_argument("--node"); agr.add_argument("--claim"); agr.add_argument("--exp")
     agr.add_argument("--project", help="project this agent owns (sub-monitors/researchers)"); agr.add_argument("--session", help="this agent's own session id (for revival/handoff)")
+    agr.add_argument("--gpu", help="gpu_type this agent coordinates (gpu_coordinator one-per-GPU keying, e.g. H100)")
     agr.set_defaults(fn=cmd_agent_register)
     hb = sub.add_parser("heartbeat")
     hb.add_argument("--agent", required=True); hb.add_argument("--status"); hb.add_argument("--note")
     hb.add_argument("--role"); hb.add_argument("--claim"); hb.add_argument("--exp")
-    hb.add_argument("--project"); hb.add_argument("--session")
+    hb.add_argument("--project"); hb.add_argument("--session"); hb.add_argument("--gpu")
     hb.set_defaults(fn=cmd_heartbeat)
     sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
     sub.add_parser("submonitors").set_defaults(fn=cmd_submonitors)
+    sub.add_parser("coordinators").set_defaults(fn=cmd_coordinators)
     rp = sub.add_parser("report")
     rp.add_argument("--agent", required=True); rp.add_argument("--role")
     rp.add_argument("--done"); rp.add_argument("--doing"); rp.add_argument("--blocked")

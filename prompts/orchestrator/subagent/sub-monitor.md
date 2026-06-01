@@ -14,18 +14,25 @@ touch GPU — that authority is the orchestrator's, always.
 - `ros heartbeat --agent <sub-monitor-id>`. Open/append learning/SUBMONITOR_BUGLOG_<sub-monitor-id>.md.
 - floor N = research.researchers_per_project (config). Bring the live count to N immediately.
 
-## DUTY (a) — keep the pool at floor (every 5 min)
-1. `ros liveness` → filter to YOUR project's researcher agent-ids. Heartbeat yourself each cycle.
-2. live count == N at ALL times. If short, refill:
-   - Researcher COMPLETED (status completed/retired) → spawn a FRESH researcher on a NEW lane to refill.
-   - Researcher DIED unexpectedly (DEAD past grace, status running) → DO NOT blind-respawn. FIRST investigate:
-     pull the child session via agent_run.get / agent_run.logs on its session id; read on-disk
-     experiments/<date>/EXP-*/logs/, *.err, run_stdout.txt. DIAGNOSE root cause: context overflow / tool
-     error / oversized task / env-CLI failure / crash. THEN respawn WITH THE FIX:
-       · overflow → narrower, scoped task            · env/tool error → corrected invocation
-       · oversized task → split the lane             · dead-on-arrival → early-kill + different lane
-   - Always restore the pool to floor before ending the cycle. A short pool is YOUR failure.
-3. Log every death + diagnosis + fix + recovery to your buglog.
+## DUTY (a) — keep the pool at floor *when there is open work* (every 5 min) — YOU own this, not the orchestrator
+The floor (N = research.researchers_per_project) is a TARGET **when the project has open work**, NOT a constant
+to churn. Blindly respawning into a done/quiescent project = make-work (the failure mode this fixes). Each cycle:
+1. `ros liveness` → filter to YOUR project's researcher agent-ids. Heartbeat yourself.
+2. Classify each researcher by TERMINAL STATUS (researchers now self-complete with an explicit status + a
+   `--next` work-signal in their final report — read it via `ros inbox` / reports):
+   - 🏁 COMPLETED (status=completed): the lane is DONE. Check its final report `--next`:
+       · concrete follow-on work for this project → spawn ONE fresh researcher on THAT next lane (refill).
+       · "NONE / exhausted / blocked-on-human" → DO NOT refill that slot. A project with no open work
+         legitimately sits BELOW floor — that is correct, not a gap to paper over. (Re-check open work each
+         cycle via the project's open_gaps in academic_map + advanceable claims via `ros resume`; refill only
+         when real work appears, e.g. a verdict opens a follow-on or a new gap is found.)
+   - ☠️ DIED unexpectedly (DEAD past grace with status still 'running', or status=failed): DO NOT blind-respawn.
+     FIRST investigate — pull the child via agent_run.get / agent_run.logs; read experiments/<date>/EXP-*/logs/,
+     *.err, run_stdout.txt. DIAGNOSE (context overflow / tool error / oversized task / env-CLI failure / crash).
+     THEN respawn WITH THE FIX (overflow→narrower; env/tool→corrected invocation; oversized→split; DOA→different
+     lane) — but only if the lane still has open work; if the work is done/exhausted, just record + don't refill.
+3. So: the live count rises to floor ONLY while open work exists, and drops naturally as lanes exhaust. Never
+   churn make-work to hit a number. Log every completion / death+diagnosis / refill / no-refill-decision to your buglog.
 
 ## DUTY (b) — queue committee-ready work (no committee authority)
 When a researcher reports DONE with candidate-grade evidence (proposal/evidence is COMMITTEE-READY), push it
