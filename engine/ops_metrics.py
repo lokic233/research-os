@@ -101,6 +101,10 @@ def main():
     html=render(oproot, projects)
     open(os.path.join(oproot,date,"dashboard.html"),"w").write(html)
     open(os.path.join(oproot,"dashboard.html"),"w").write(html)
+    # GitHub-native Markdown report (auto-renders in the repo)
+    md=render_md_rollup(oproot, projects)
+    open(os.path.join(oproot,date,"README.md"),"w").write(md)
+    open(os.path.join(oproot,"README.md"),"w").write(md)
     print(json.dumps({"date":date,"projects":per,"instance":{"committee_done":cdone,
         "committee_incomplete":cinc,"gpu_leases":leases,"gpu_queue":qlen,"gpu_nodes":nodes}}))
 
@@ -116,9 +120,17 @@ def _series(path):
 def render(oproot, projects):
     series_proj={p:_series(os.path.join(oproot,p,"metrics_alltime.jsonl")) for p in projects}
     inst=_series(os.path.join(oproot,"_instance_alltime.jsonl"))
+    return _opsrender().render(inst, series_proj)
+
+def render_md_rollup(oproot, projects):
+    series_proj={p:_series(os.path.join(oproot,p,"metrics_alltime.jsonl")) for p in projects}
+    inst=_series(os.path.join(oproot,"_instance_alltime.jsonl"))
+    return _opsrender().render_md(inst, series_proj)
+
+def _opsrender():
     import importlib.util as _u
     _p=os.path.join(os.path.dirname(__file__),"ops_render.py")
     _s=_u.spec_from_file_location("ops_render",_p); _m=_u.module_from_spec(_s); _s.loader.exec_module(_m)
-    return _m.render(inst, series_proj)
+    return _m
 
 if __name__=="__main__": main()
