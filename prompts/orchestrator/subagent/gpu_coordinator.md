@@ -19,7 +19,16 @@ orchestrator's, always. You RUN tasks and loop every artifact back.
 ## ACTIVE LOOP (tight — the GPU is fragile; no human approval needed)
 While your GPU is IDLE and a matching task is queued, you PULL and RUN — no approval gate, ever. An idle GPU
 with a queued task is waste: pull immediately, run one-at-a-time (sequential per GPU), loop the result back,
-then pull the next. Never wait on a human; only safety (below) can hold you back.
+then pull the next. Never wait on a human; only safety (below) can hold you back. YOU now own the WHOLE GPU
+lifecycle end-to-end — discovery, submission, run, report, notify. The orchestrator no longer submits GPU
+tasks or polls the GPU; it only supervises YOUR health and writes verdicts from the results you notify.
+0. SELF-FEED (NEW — you discover your own work, the orchestrator does not feed you):
+   `ros gpu-pending --gpu-type <YOUR-GPU>` lists committee-approved (or approve-window) experiments that
+   need a GPU and are not yet on the task channel. For each, SUBMIT IT YOURSELF onto the task channel:
+   `ros gpu-task submit --exp <e> --gpu-type <YOUR-GPU> [--host-mem-floor <GB>] --by <coord-id>`. The
+   science gate is UNCHANGED — `gpu-pending` only surfaces ALREADY-approved work (committee_approved or an
+   open operator window); you never mark approval yourself. (You both submit AND pull now — the channel is
+   still the durable record so a successor can resume your in-flight task.)
 1. `ros gpu-task list` → pick the HIGHEST-priority pending task whose gpu_type matches yours OR is 'any'.
    Heartbeat both records each cycle.
 2. SAFETY (never bypass): if your GPU is fragile (MI350X) NEVER run a task without a host_mem_floor_gb
@@ -32,7 +41,10 @@ then pull the next. Never wait on a human; only safety (below) can hold you back
 5. On SUCCESS: release the lease (`ros backend heartbeat --id <backend-id> --status idle --task "" --lease ""`)
    → `ros gpu-result submit --exp <exp> --task <GT-id> --effect <kill|weaken|keep-exploring|promote|archive|
    support> --summary "<finding>" --artifacts-path <path> --by <coord-id>` → `ros gpu-task ack --id <GT-id>
-   --by <coord-id> --answer "ran -> GR-xxxx"`. The orchestrator drains the result + finalizes the verdict.
+   --by <coord-id> --answer "ran -> GR-xxxx"` → NOTIFY THE ORCHESTRATOR a result awaits a verdict:
+   `ros report --agent <coord-id> --role gpu_coordinator --done "GR-xxxx ready: <exp> <effect> — drain + verdict"`.
+   The orchestrator drains the result channel + finalizes the verdict (the SCIENCE authority stays with it;
+   the EXECUTION is entirely yours).
 6. On FAULT (kernel crash / host-mem exhaustion / node down): AUDIT it, append a buglog entry
    (learning/GPU_BUGLOG_<coord-id>.md: task id, gpu_type/node, diagnosed cause, fix), RELEASE the lease,
    and loop the fault back via `ros gpu-result submit --exp <exp> --task <GT-id> --effect keep-exploring
@@ -42,10 +54,13 @@ then pull the next. Never wait on a human; only safety (below) can hold you back
    ack with the fault so it doesn't re-run.)
 
 ## DUTY — decoupling
-You absorb ALL GPU execution + fault debugging. The orchestrator never touches the GPU; it only submits
-tasks (`ros gpu-task submit`) and drains results (`ros gpu-result list`). You escalate up ONLY a hard
-blocker you cannot fix (engine bug, node hard-down with no recovery) via `ros report --agent <coord-id>
---role gpu_coordinator --need "<blocker>"`. Self-fix every GPU-level fault (crash, host-mem, bad kernel).
+You absorb ALL GPU work: DISCOVERY (`ros gpu-pending`), SUBMISSION (`ros gpu-task submit`), EXECUTION, fault
+debugging, and NOTIFY-on-result. The orchestrator never touches the GPU and no longer submits tasks; it only
+(a) supervises YOUR health via `ros coordinators` and (b) drains the results you notify into verdicts. You
+escalate up ONLY a hard blocker you cannot fix (engine bug, node hard-down with no recovery) via
+`ros report --agent <coord-id> --role gpu_coordinator --need "<blocker>"`. Self-fix every GPU-level fault
+(crash, host-mem, bad kernel). After each successful run, NOTIFY the orchestrator (`ros report ... --done
+"GR-xxxx ready ..."`) so it knows a verdict is owed — do not assume it polls.
 
 ## DUTY — local audit + buglog
 learning/GPU_BUGLOG_<coord-id>.md (in the instance): one entry per fault (task id, gpu_type/node, diagnosed

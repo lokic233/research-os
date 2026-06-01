@@ -1034,6 +1034,53 @@ def cmd_backend_list(args):
     dead = [r[0] for r in rows if r[6]=="DEAD"]
     if dead: print(f"  ⚠️ DEAD backends (past {grace}m grace): {', '.join(dead)}")
 
+def cmd_gpu_pending(args):
+    """TASK_COORDINATOR self-feed discovery: list experiments that are READY to run on a GPU but not yet
+    on the task channel — so the coordinator pulls its own work instead of waiting for the orchestrator to
+    submit. An exp qualifies when: needs_gpu==true AND status==pending AND result not yet recorded AND
+    (committee_approved OR a gpu-approve-window is open) AND it is not already queued/acked on the task
+    channel. Optionally filter by --gpu-type (matches the exp's hardware/gpu_type or 'any').
+    The science gate is UNCHANGED: committee_approved (or an explicit operator window) is still required —
+    discovery never invents approval, it only surfaces already-approved work to the runner."""
+    root = inst_root(args)
+    if Channel is None: sys.exit("❌ channeling unavailable.")
+    _win,_until = _gpu_window_open(root)
+    # already-on-channel exp ids (pending or acked) — don't re-surface
+    on_channel = set()
+    try:
+        for it in _gpu_task_channel(root).list(include_acked=True):
+            if it.get("exp_id"): on_channel.add(it["exp_id"])
+    except Exception:
+        pass
+    want_gt = (args.gpu_type or "").strip().lower()
+    rows = []
+    for ef in glob.glob(os.path.join(root, "experiments", "**", "experiment.yaml"), recursive=True):
+        exp = load_yaml(ef, {}) or {}
+        eid = exp.get("exp_id")
+        if not eid or eid in on_channel: continue
+        if not exp.get("needs_gpu"): continue
+        if (exp.get("status") or "").lower() not in ("pending", "designed", "ready", ""): continue
+        if (exp.get("result_effect") or "").strip(): continue   # already has a recorded effect
+        approved = bool(exp.get("committee_approved"))
+        if not (approved or _win): continue                      # science gate (or open window) required
+        budget = (exp.get("resource_budget") or {})
+        floor = int(budget.get("host_mem_floor_gb", 0) or 0)
+        # gpu_type: prefer explicit field, else parse hardware string, else 'any'
+        gt = (exp.get("gpu_type") or "").strip()
+        if not gt:
+            hw = (exp.get("hardware") or "").upper()
+            gt = "H100" if "H100" in hw else ("MI350X" if "MI350X" in hw or "MI300" in hw else "any")
+        if want_gt and gt.lower() != want_gt and gt.lower() != "any": continue
+        rows.append({"exp": eid, "claim": exp.get("claim_id") or "", "gpu": gt,
+                     "floor": floor, "approved": approved, "via": "committee" if approved else f"window(until {_until})"})
+    if not rows:
+        print("(no GPU-ready experiments awaiting a coordinator — self-feed queue empty)"); return
+    print(f"GPU-PENDING (coordinator self-feed) — {len(rows)} ready, not yet on task channel:")
+    for r in rows:
+        print(f"  exp={r['exp']} claim={r['claim']} gpu={r['gpu']} floor={r['floor']}GB approved_via={r['via']}")
+    print("→ task_coordinator: `ros gpu-task submit --exp <e> --gpu-type <T> [--host-mem-floor <GB>] "
+          "--by <coord-id>` then pull+run+report; the orchestrator no longer submits.")
+
 def cmd_gpu_task_submit(args):
     """ORCHESTRATOR pushes a committee-approved GPU experiment onto the gpu TASK channel. A gpu_coordinator
     pulls the next matching task for its GPU. Mirrors the cmd_gpu_queue safety gates (committee + fragile)."""
@@ -1368,6 +1415,9 @@ def main():
     bks.add_parser("list").set_defaults(fn=cmd_backend_list)
     # v2 STAGE B: gpu task channel (orchestrator -> gpu_coordinator)
     gt=sub.add_parser("gpu-task"); gts=gt.add_subparsers(dest="sub",required=True)
+    # v2: task_coordinator self-feed discovery (replaces orchestrator-driven gpu-task submission)
+    gpd=sub.add_parser("gpu-pending"); gpd.add_argument("--gpu-type",dest="gpu_type",help="H100|MI350X (filter)")
+    gpd.set_defaults(fn=cmd_gpu_pending)
     gtsub=gts.add_parser("submit")
     gtsub.add_argument("--exp",required=True); gtsub.add_argument("--gpu-type",dest="gpu_type",help="H100|MI350X|any")
     gtsub.add_argument("--host-mem-floor",dest="host_mem_floor",type=int)
