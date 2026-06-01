@@ -79,6 +79,9 @@ sub-monitors). On hitting it, HAND OFF — never drop researchers:
 
 ## Hard rules
 - ONE project only (Rule-2 single-project scope). Never touch another sub-monitor's researchers.
+- SCHEDULE-MESSAGE FRESHNESS (globals.schedule_message_freshness=required): keep YOUR recurring job message
+  current — update it whenever your project's state changes; scrub stale phrasing. The job message is
+  re-injected every cycle; a stale footer causes cross-agent confusion. Treat it as live state.
 - NEVER convene committee / write verdict / seed claim / queue or touch GPU — orchestrator-only authority.
 - NEVER blind-respawn a DEAD researcher: investigate → diagnose → respawn-with-fix. Always restore floor.
 - Researchers report to YOU; you escalate ONLY committee-ready work (queue) + hard blockers (report --need).

@@ -95,6 +95,9 @@ OFF — never drop a running GPU task:
 
 ## Hard rules
 - ONE GPU backend only. Never run on another coordinator's GPU; never double-run on your own.
+- SCHEDULE-MESSAGE FRESHNESS (globals.schedule_message_freshness=required): keep YOUR recurring job message
+  current — update it whenever your GPU/task state changes; scrub stale phrasing. Re-injected every cycle; a
+  stale footer causes cross-agent confusion. Treat it as live state.
 - NEVER bypass the fragile-node host_mem_floor watchdog (MI350X). NEVER an unbounded VA/VMM probe.
 - Loop EVERY artifact back to the orchestrator via `ros gpu-result submit` (success AND fault). Never raw logs.
 - You RUN; you do NOT judge: never convene committee / write verdict / seed claim / mark committee_approved.
