@@ -1388,6 +1388,42 @@ def cmd_queue_ack(args):
     print(f"✅ acked {n} queue item(s)" + (f": {args.answer}" if args.answer else ""))
 
 
+def cmd_commit(args):
+    """Commit + push ALL durable instance state to GitHub. The CORE persistence feature: uncommitted local
+    work is LOST if a session dies/retires. Every agent should call this frequently (each cycle, and ALWAYS
+    at spawn/retire boundaries). Uses HTTPS (SSH port 22 is blocked on the control Mac — see meta GIT_PUSH.md);
+    auto-fixes an SSH remote to HTTPS so push never silently fails. No-op (clean exit) if nothing to commit."""
+    import subprocess
+    root = inst_root(args)
+    def _git(*a, **k):
+        return subprocess.run(["git", "-C", root, *a], capture_output=True, text=True, timeout=k.get("t", 60))
+    # nothing staged/dirty/untracked? -> still push in case of unpushed commits, else exit clean
+    st = _git("status", "--porcelain")
+    dirty = bool(st.stdout.strip())
+    # ensure HTTPS remote (SSH is blocked on this Mac)
+    url = _git("remote", "get-url", "origin").stdout.strip()
+    if url.startswith("git@github.com:"):
+        https = "https://github.com/" + url.split("git@github.com:", 1)[1]
+        _git("remote", "set-url", "origin", https)
+        print(f"   (fixed SSH->HTTPS remote: {https})")
+    if dirty:
+        _git("add", "-A")
+        msg = args.message or f"ros commit (autosave {NOW()})"
+        c = _git("commit", "-m", msg)
+        if c.returncode != 0 and "nothing to commit" not in (c.stdout + c.stderr):
+            print(f"⚠️ commit issue: {(c.stdout + c.stderr).strip()[:300]}")
+    else:
+        print("   (working tree clean — checking for unpushed commits)")
+    p = _git("push", "origin", "HEAD", t=90)
+    out = (p.stdout + p.stderr).strip()
+    if p.returncode == 0:
+        head = _git("rev-parse", "--short", "HEAD").stdout.strip()
+        print(f"✅ ros commit: pushed (HEAD {head}). {'committed + ' if dirty else ''}up to date with origin.")
+    else:
+        print(f"❌ push FAILED: {out[:400]}")
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -1479,6 +1515,9 @@ def main():
     sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
     sub.add_parser("submonitors").set_defaults(fn=cmd_submonitors)
     sub.add_parser("coordinators").set_defaults(fn=cmd_coordinators)
+    cm = sub.add_parser("commit")
+    cm.add_argument("--message", "-m", help="commit message (default: ros commit autosave <ts>)")
+    cm.set_defaults(fn=cmd_commit)
     gaw = sub.add_parser("gpu-approve-window")
     gaw.add_argument("--hours", type=float, help="open the auto-approve window for N hours (default 24)")
     gaw.add_argument("--clear", action="store_true", help="close the window now")

@@ -66,6 +66,8 @@ escalate up ONLY a hard blocker you cannot fix (engine bug, node hard-down with 
 learning/GPU_BUGLOG_<coord-id>.md (in the instance): one entry per fault (task id, gpu_type/node, diagnosed
 cause, fix applied), per dispatch, per result submitted, per escalation. Source of truth for your GPU's
 health. Self-fix GPU-level faults; escalate ENGINE bugs only — never self-patch the engine.
+PERSIST IT: run `ros commit -m "gpu-coord <id> buglog"` after writing buglog entries + result artifacts + at
+retire/handoff — uncommitted buglogs/result files are LOST if you die. Don't let work sit local past a cycle.
 
 ## SELF-RETIRE + GRACEFUL HANDOFF at >=N% context
 N = config globals.retire_at_context_pct (or research.sub_monitor.retire_at_context_pct), default 35% (~350k

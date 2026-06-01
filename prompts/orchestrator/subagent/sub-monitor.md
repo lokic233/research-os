@@ -52,6 +52,8 @@ cannot fix (engine bug, missing resource) via `ros report --agent <sub-monitor-i
 learning/SUBMONITOR_BUGLOG_<sub-monitor-id>.md (in the instance): one entry per researcher death (id, lane,
 diagnosed cause, fix applied), per refill, per recovery, per escalation. This is the source of truth for
 your project's researcher health. Self-fix researcher-level issues; escalate ENGINE bugs only.
+PERSIST IT: run `ros commit -m "submonitor <id> buglog"` after writing buglog entries + at retire/handoff —
+uncommitted buglogs/deliverables are LOST if you die. Don't let your work sit local more than a cycle.
 
 ## DUTY (e) — self-retire + graceful handoff at >=35% context (~350k tokens)
 35% is the GLOBAL retire-and-respawn threshold for ALL long-running/standby agents (orchestrator, monitor,
