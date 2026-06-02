@@ -273,6 +273,32 @@ def cmd_exp_complete(args):
     exp["status"] = "completed"; exp["result_effect"] = args.effect
     exp["result_summary"] = args.summary; exp["completed_at"] = NOW()
     dump_yaml(ef, exp)
+    # ★ BUG-60 FIX (anti-sprawl / false-DEAD): when a researcher finishes its experiment, mark the OWNING
+    # RESEARCHER AGENT 'completed' if it has no other pending/running experiment. Previously exp complete
+    # updated the experiment + claim but NEVER the agent, so a finished researcher lingered status:running,
+    # went past-grace, and the reaper flagged it DEAD (a false coverage gap -> spurious AGENT_DOWN + a
+    # tempting respawn of a researcher whose work was already done). Owner is taken from --by (explicit,
+    # no fragile id string-matching) or the experiment's recorded session/dispatched_by if it maps to an agent.
+    rd_ = runtime_dir(root)
+    owner = getattr(args, "by", None) or exp.get("ran_by") or exp.get("dispatched_by") or ""
+    if owner:
+        ap = os.path.join(rd_, "agents", f"{owner}.yaml")
+        if os.path.exists(ap):
+            ag = load_yaml(ap, {}) or {}
+            # only auto-complete a RESEARCHER (never a sub-monitor/orchestrator/coordinator) and only if
+            # it has no OTHER still-open experiment (don't kill an agent mid-second-experiment).
+            is_researcher = (ag.get("role") == "researcher") or ("researcher" in (ag.get("agent_id") or ""))
+            other_open = False
+            for eo in glob.glob(os.path.join(root, "experiments", "**", "experiment.yaml"), recursive=True):
+                eob = load_yaml(eo, {}) or {}
+                if eob.get("exp_id") == args.exp: continue
+                if (eob.get("ran_by") == owner or eob.get("dispatched_by") == owner) and eob.get("status") in ("pending","running","dispatched","faulted"):
+                    other_open = True; break
+            if is_researcher and ag.get("status") in ("running","active","registered","") and not other_open:
+                ag["status"] = "completed"; ag["completed_at"] = NOW()
+                ag["completed_note"] = f"EXP {args.exp} terminal ({args.effect}); researcher work done"
+                dump_yaml(ap, ag)
+                print(f"   researcher {owner} -> completed (EXP-terminal; not a reap-DEAD false-flag)")
     # BUG-54 fix: release the GPU node lease this exp held (dispatch recorded it). Without this the node
     # stays leased forever after the exp completes -> all future dispatches refused / node looks BUSY.
     _lease = exp.get("node_lease", "")
@@ -1863,6 +1889,7 @@ def main():
     ec = esub.add_parser("complete")
     ec.add_argument("--exp", required=True); ec.add_argument("--effect", required=True)
     ec.add_argument("--summary", required=True); ec.add_argument("--revival")
+    ec.add_argument("--by", help="researcher agent id that ran this exp — auto-marks it 'completed' on EXP-terminal (BUG-60: avoids reaper false-DEAD of a finished researcher)")
     ec.add_argument("--commit", action="store_true", help="git-commit durable state after completing")
     ec.add_argument("--force-demote", dest="force_demote", action="store_true", help="explicitly allow killing/weakening a PROMOTED claim (BUG-25 guard override)")
     ec.set_defaults(fn=cmd_exp_complete)
