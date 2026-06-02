@@ -1429,6 +1429,117 @@ def cmd_commit(args):
         sys.exit(1)
 
 
+# ---------------- SUPERVISION TREE + TASK LEDGER + REAPER (BUG-31..34) ----------------
+def _sup_helpers():
+    """Bundle ros.py helpers for engine/supervise.py (avoids circular import)."""
+    return {"load_yaml": load_yaml, "dump_yaml": dump_yaml, "NOW": NOW, "next_id": next_id,
+            "reg_dir": reg_dir, "runtime_dir": runtime_dir, "_cfg": _cfg, "Channel": Channel}
+
+def _sup():
+    import importlib, supervise
+    importlib.reload(supervise) if False else None
+    return supervise
+
+def cmd_task_open(args):
+    import supervise
+    root = inst_root(args); H = _sup_helpers()
+    tid, path = supervise.task_open(H, root, kind=args.kind, parent=args.parent, assignee=args.assignee,
+                                    project=args.project or "", claim=args.claim or "", exp=args.exp or "",
+                                    session=args.session or "", summary=args.summary or "")
+    print(f"✅ {tid} opened (kind={args.kind}, assignee={args.assignee or '-'}, parent={args.parent or '-'}) -> {os.path.relpath(path, root)}")
+
+def cmd_task_update(args):
+    import supervise
+    root = inst_root(args); H = _sup_helpers()
+    rec = supervise.task_update(H, root, args.id, assignee=args.assignee, status=args.status,
+                                session=args.session, evidence_delta=args.evidence_delta, by=args.by or "", note=args.note or "")
+    print(f"✅ {args.id} -> status={rec.get('status')} assignee={rec.get('assignee','-')}"
+          + (f" evidence_delta={rec['evidence_delta'][:60]}" if rec.get('evidence_delta') else ""))
+
+def cmd_task_list(args):
+    import supervise
+    root = inst_root(args); H = _sup_helpers()
+    rows = supervise.task_list(H, root, only_open=args.open, only_orphans=args.orphans, project=args.project)
+    if not rows: print("(no tasks)"); return
+    print(f"TASKS ({len(rows)}):")
+    for r in rows:
+        mark = {"open":"○","active":"▶","orphaned":"⚠️","done":"✓","dropped":"✗"}.get(r.get("status"),"?")
+        print(f"  {mark} {r['task_id']} [{r.get('status')}] {r.get('kind','')} "
+              f"assignee={r.get('assignee','-')} parent={r.get('parent','-')} {r.get('project_id','')} "
+              f"{r.get('claim_id','')}".rstrip())
+        if r.get("summary"): print(f"        {r['summary'][:100]}")
+        if r.get("evidence_delta"): print(f"        Δ {r['evidence_delta'][:100]}")
+
+def cmd_reap(args):
+    import supervise
+    root = inst_root(args); H = _sup_helpers(); cfg = _cfg(root)
+    grace = int((cfg.get("liveness", {}) or {}).get("patient_grace_minutes", 45))
+    conv = [os.path.basename(p) for p in glob.glob(os.path.join(root, "projects", "PROJ-*")) if _is_converged_project(p)]
+    changes, notifs = supervise.reap(H, root, apply=args.apply, grace_min=grace, converged_pids=conv)
+    if not changes: print("✅ no lingering agents (all alive within grace or already terminal)."); return
+    verb = "REAPED" if args.apply else "WOULD REAP (dry-run; pass --apply)"
+    n_dead = sum(1 for c in changes if c[2] == "dead")
+    n_sup = sum(1 for c in changes if c[2] == "superseded")
+    n_ret = sum(1 for c in changes if c[2] == "retired")
+    print(f"{verb} — {len(changes)} lingering agent(s): {n_sup} superseded, {n_ret} retired(converged), {n_dead} DEAD(active-gap):")
+    for aid, old, new, proj, role, note in changes:
+        flag = " ❗" if new == "dead" else ""
+        print(f"  {aid:28} {old} -> {new}{flag}  ({proj or '-'}/{role}) {note}")
+    if notifs:
+        print(f"\n📨 {len(notifs)} orchestrator notification(s): " + ", ".join(f"{k}:{s}" for k,s,_ in notifs))
+    if not args.apply: sys.exit(3)
+
+def cmd_handoff(args):
+    import supervise
+    root = inst_root(args); H = _sup_helpers()
+    rec = supervise.handoff(H, root, frm=args.frm, to=args.to, project=args.project or "",
+                            researcher_state=args.researcher_state or "", seeder_state=args.seeder_state or "",
+                            open_work=args.open_work or "", evidence_delta=args.evidence_delta or "",
+                            reseed_needed=args.reseed_needed, by=args.by or "", task=args.task or "")
+    print(f"✅ handoff {args.frm} -> {args.to} recorded"
+          + (f" (task {args.task} transferred)" if args.task else "")
+          + (" ⚠️ RESEED_NEEDED notified to orchestrator" if args.reseed_needed else ""))
+
+def cmd_tree(args):
+    import supervise, datetime as _dt
+    root = inst_root(args); H = _sup_helpers(); cfg = _cfg(root)
+    grace = int((cfg.get("liveness", {}) or {}).get("patient_grace_minutes", 45))
+    agents = supervise.tree(H, root, grace_min=grace)
+    show_all = args.all
+    live = [a for a in agents if a.get("status") in ("running","active","open") and a["_age"] <= grace]
+    byid = {a.get("agent_id"): a for a in agents}
+    children = {}
+    for a in agents:
+        children.setdefault(a.get("parent","") or "(root)", []).append(a)
+    def _mark(a):
+        st = a.get("status","?")
+        if st in ("retired","completed","done"): return "🏁"
+        if st in ("dead","failed"): return "☠️"
+        if st == "superseded": return "♻️"
+        if a["_age"] > grace: return "☠️"   # past-grace but still flagged running = lingering (reap candidate)
+        return "💓" if a["_age"] <= grace*1.0 else "⏳"
+    def _emit(pid, depth):
+        for a in sorted(children.get(pid, []), key=lambda x: x.get("agent_id","")):
+            st = a.get("status","?")
+            if not show_all and st in ("retired","superseded","dead","failed","completed","done","dropped"):
+                continue
+            print("  "*depth + f"{_mark(a)} {a.get('agent_id')} [{st}] {a.get('role','')} "
+                  f"{a.get('project_id','')} last={round(a['_age'],1)}m".rstrip())
+            _emit(a.get("agent_id"), depth+1)
+    print(f"SUPERVISION TREE ({len(live)} live / {len(agents)} total; grace={grace}m)"
+          + ("" if show_all else " — live only, pass --all for full") + ":")
+    _emit("(root)", 0)
+    # also surface any non-rooted live agents
+    rooted = set()
+    def _collect(pid):
+        for a in children.get(pid, []):
+            rooted.add(a.get("agent_id")); _collect(a.get("agent_id"))
+    _collect("(root)")
+    orphans = [a for a in live if a.get("agent_id") not in rooted]
+    if orphans:
+        print("  (live agents with no parent edge:)")
+        for a in orphans: print(f"    {_mark(a)} {a.get('agent_id')} [{a.get('status')}] {a.get('role','')}")
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -1588,6 +1699,39 @@ def main():
     ed.add_argument("--by", help="orchestrator id"); ed.add_argument("--approve", action="store_true")
     ed.add_argument("--force", action="store_true", help="override committee-approval requirement (explicit)")
     ed.set_defaults(fn=cmd_exp_dispatch)
+    # ---- supervision tree + task ledger + reaper (BUG-31..34) ----
+    tk = sub.add_parser("task"); tks = tk.add_subparsers(dest="sub", required=True)
+    tko = tks.add_parser("open")
+    tko.add_argument("--kind", required=True, help="monitor|research|design|committee|gpu (task category)")
+    tko.add_argument("--parent", help="parent agent id (e.g. orchestrator-r15-001)")
+    tko.add_argument("--assignee", help="agent id that owns this task")
+    tko.add_argument("--project"); tko.add_argument("--claim"); tko.add_argument("--exp")
+    tko.add_argument("--session"); tko.add_argument("--summary")
+    tko.set_defaults(fn=cmd_task_open)
+    tku = tks.add_parser("update"); tku.add_argument("--id", required=True)
+    tku.add_argument("--assignee"); tku.add_argument("--status", help="open|active|orphaned|done|dropped")
+    tku.add_argument("--session"); tku.add_argument("--evidence-delta", dest="evidence_delta")
+    tku.add_argument("--by"); tku.add_argument("--note")
+    tku.set_defaults(fn=cmd_task_update)
+    tkl = tks.add_parser("list"); tkl.add_argument("--open", action="store_true", help="only un-closed tasks")
+    tkl.add_argument("--orphans", action="store_true", help="only orphaned tasks")
+    tkl.add_argument("--project")
+    tkl.set_defaults(fn=cmd_task_list)
+    rpe = sub.add_parser("reap"); rpe.add_argument("--apply", action="store_true", help="actually flip statuses (default dry-run)")
+    rpe.set_defaults(fn=cmd_reap)
+    ho = sub.add_parser("handoff")
+    ho.add_argument("--from", dest="frm", required=True); ho.add_argument("--to", required=True)
+    ho.add_argument("--project"); ho.add_argument("--task")
+    ho.add_argument("--researcher-state", dest="researcher_state", help="alive|dead|completed|none + detail")
+    ho.add_argument("--seeder-state", dest="seeder_state", help="state of the claim-seeder researcher")
+    ho.add_argument("--open-work", dest="open_work"); ho.add_argument("--evidence-delta", dest="evidence_delta")
+    ho.add_argument("--reseed-needed", dest="reseed_needed", action="store_true",
+                    help="monitored researcher/seeder is dead+work-open -> orchestrator must dispatch a fresh one")
+    ho.add_argument("--by")
+    ho.set_defaults(fn=cmd_handoff)
+    tr = sub.add_parser("tree"); tr.add_argument("--all", action="store_true", help="include terminal/retired agents")
+    tr.set_defaults(fn=cmd_tree)
+
     args = ap.parse_args(); args.fn(args)
 
 if __name__ == "__main__": main()
