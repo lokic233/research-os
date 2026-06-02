@@ -1622,9 +1622,13 @@ def cmd_queue_submit(args):
         ch = _committee_channel(root)
         # ★ BUG-59: mirror queue_id INSIDE the channel lock (was a separate unlocked read-modify-write
         # that could clobber a concurrent submit). submit() now writes queue_id atomically.
-        r = ch.submit(payload, dedup_keys=["claim_id", "experiment_ids"], mirror_id_key="queue_id")
+        # ★ BUG-67: dedup on (claim_id, kind), NOT (claim_id, experiment_ids) — the proj_monitor cron and
+        # the orchestrator can both FORWARD the same claim with DIFFERENT cited exps (cron may cite none),
+        # which slipped past an experiment_ids-keyed dedup -> two PENDING committee items for one claim.
+        # A claim must not be queued twice for the same review kind while one is still pending.
+        r = ch.submit(payload, dedup_keys=["claim_id", "kind"], mirror_id_key="queue_id")
         if r.get("dup"):
-            print(f"↩︎ already queued as {r['id']} (claim {args.claim}, exps {exp_ids}) — not duplicating."); return
+            print(f"↩︎ already queued as {r['id']} (claim {args.claim}, kind {args.kind or 'committee'}) — not duplicating."); return
         qid = r["id"]
     else:
         q = load_yaml(_queue_path(root), {"queue": []}) or {"queue": []}
