@@ -2083,6 +2083,111 @@ def cmd_progress(args):
     sys.exit(3)
 
 
+# ============================ v3 TWO-TIER LEARNING (warm-start / daily / distill) ============================
+# DESIGN_v3_lean_architecture.md "LEARNING SYSTEM (two tiers)". Replaces the v2 flat learning/ graveyard
+# (per-agent handoff+buglog files re-read on every boot -> context bloat -> self-kill death spiral).
+#   TIER 1  learning/roles/<role>.md        — curated role-family brain, SMALL. A fresh/successor agent
+#                                             reads THIS on boot (cheap warm-start), NOT raw history.
+#   TIER 2  learning/<role>/YYYY-MM-DD.md    — append-only per-role per-date daily log.
+# ON RETIRE@350k: distill the most valuable learnings -> append to BOTH Tier-1 brain + Tier-2 dated.
+# A "role" here is the role-FAMILY (orchestrator / researcher / committee), not the per-generation id.
+
+_ROLE_FAMILIES = ("orchestrator", "researcher", "committee", "monitor", "coordinator",
+                  "committee_health", "proj_monitor")
+# The 6 committee member roles all fold into the 'committee' role-family (one shared reviewer brain).
+_COMMITTEE_MEMBER_ROLES = ("novelty_killer", "systems_reviewer", "evaluation_prosecutor",
+                           "theory_skeptic", "product_realist", "area_chair")
+
+def _role_family(role):
+    """Normalize an agent id/role to its role-family (the Tier-1 brain key). e.g. orchestrator-r15-001
+    -> orchestrator; researcher-0026-lift-r8 -> researcher; sub-monitor-0013-r17 -> proj_monitor;
+    novelty_killer/area_chair/... -> committee."""
+    r = (role or "").lower()
+    if "sub-monitor" in r or "submonitor" in r or "proj" in r: return "proj_monitor"
+    if "orchestrat" in r: return "orchestrator"
+    if "research" in r or "seeder" in r: return "researcher"
+    if "committee_health" in r or "committee-health" in r: return "committee_health"
+    if "committee" in r or "reviewer" in r: return "committee"
+    if any(m in r for m in _COMMITTEE_MEMBER_ROLES): return "committee"
+    if "coordinat" in r: return "coordinator"
+    if "monitor" in r: return "monitor"
+    for fam in _ROLE_FAMILIES:
+        if r == fam: return fam
+    return r or "unknown"
+
+def _tier1_path(root, role):
+    return os.path.join(root, "learning", "roles", f"{_role_family(role)}.md")
+
+def _tier2_path(root, role, date=None):
+    return os.path.join(root, "learning", _role_family(role), f"{_valid_date(date)}.md")
+
+def cmd_learn_warm(args):
+    """v3 WARM-START (read-only): print the Tier-1 role-family brain a fresh/successor agent reads on boot.
+    Cheap (small curated file), NOT raw history. Optionally also tails today's Tier-2 daily log."""
+    root = inst_root(args); fam = _role_family(args.role)
+    t1 = _tier1_path(root, args.role)
+    if os.path.exists(t1):
+        print(f"===== TIER-1 ROLE BRAIN: {fam} ({os.path.relpath(t1, root)}) =====")
+        sys.stdout.write(open(t1).read())
+        if not open(t1).read().endswith("\n"): print()
+    else:
+        print(f"(no Tier-1 brain yet for role '{fam}' — first agent of this family; "
+              f"distill learnings at retire to seed {os.path.relpath(t1, root)})")
+    if getattr(args, "with_today", False):
+        t2 = _tier2_path(root, args.role)
+        if os.path.exists(t2):
+            print(f"\n===== TIER-2 TODAY: {fam} ({os.path.relpath(t2, root)}) =====")
+            sys.stdout.write(open(t2).read())
+
+def _append_md(path, text, header=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    new = not os.path.exists(path)
+    with open(path, "a") as f:
+        if new and header: f.write(header + "\n")
+        f.write(text if text.endswith("\n") else text + "\n")
+
+def cmd_learn_note(args):
+    """v3 TIER-2 daily append: append a timestamped note to learning/<role>/YYYY-MM-DD.md (append-only).
+    --text inline or --file <path> to append a file's contents. --by tags the author agent id."""
+    root = inst_root(args); fam = _role_family(args.role)
+    text = args.text or ""
+    if getattr(args, "file", None):
+        try: text = (text + "\n" if text else "") + open(args.file).read()
+        except OSError as e: sys.exit(f"❌ cannot read --file {args.file}: {e}")
+    if not text.strip(): sys.exit("❌ nothing to append (need --text or --file)")
+    by = f" [{args.by}]" if getattr(args, "by", None) else ""
+    entry = f"\n## {NOW()}{by}\n{text.rstrip()}\n"
+    t2 = _tier2_path(root, args.role)
+    _append_md(t2, entry, header=f"# TIER-2 daily log — role-family: {fam}")
+    print(f"✅ appended to Tier-2 {os.path.relpath(t2, root)} (role-family {fam})")
+
+def cmd_learn_distill(args):
+    """v3 RETIRE@350k DISTILL: append the most-valuable distilled learnings to BOTH the Tier-1 role brain
+    AND the Tier-2 dated log. Called by an ever-run agent when it hits the token ceiling, just before it
+    hands to its ONE successor (so the successor warm-starts from an updated Tier-1 brain)."""
+    root = inst_root(args); fam = _role_family(args.role)
+    text = args.text or ""
+    if getattr(args, "file", None):
+        try: text = (text + "\n" if text else "") + open(args.file).read()
+        except OSError as e: sys.exit(f"❌ cannot read --file {args.file}: {e}")
+    if not text.strip(): sys.exit("❌ nothing to distill (need --text or --file)")
+    by = f" [{args.by}]" if getattr(args, "by", None) else ""
+    t1 = _tier1_path(root, args.role); t2 = _tier2_path(root, args.role)
+    block = f"\n## DISTILLED {NOW()}{by}\n{text.rstrip()}\n"
+    _append_md(t1, block, header=f"# TIER-1 ROLE BRAIN — {fam}\n# Curated warm-start. A fresh/successor agent reads THIS on boot (NOT raw history).")
+    _append_md(t2, block, header=f"# TIER-2 daily log — role-family: {fam}")
+    print(f"✅ distilled to BOTH tiers:")
+    print(f"   Tier-1 brain: {os.path.relpath(t1, root)}")
+    print(f"   Tier-2 dated: {os.path.relpath(t2, root)}")
+    # nudge: keep the Tier-1 brain SMALL (warn if it's growing past a soft cap)
+    try:
+        sz = os.path.getsize(t1)
+        if sz > 16000:
+            print(f"   ⚠️ Tier-1 brain is {sz} bytes (>16KB) — prune/curate it; warm-start must stay cheap.")
+    except OSError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -2295,6 +2400,20 @@ def main():
     ch.set_defaults(fn=cmd_cron_health)
     pg = sub.add_parser("progress", help="v3 monitor #4 (read-only): time-since-last-real-landing per in-flight claim (local-but-uncommitted / committee-done-no-verdict / gpu-result-not-resubmitted); > stall_min(20)/gpu_stall_min(30) -> notify orchestrator")
     pg.set_defaults(fn=cmd_progress)
+    # ---- v3 TWO-TIER LEARNING (warm-start / daily / distill) ----
+    ln = sub.add_parser("learn"); lns = ln.add_subparsers(dest="sub", required=True)
+    lw = lns.add_parser("warm", help="read-only Tier-1 role brain warm-start (what a fresh/successor agent reads on boot)")
+    lw.add_argument("--role", required=True, help="role-family or agent id (orchestrator|researcher|committee|monitor|...)")
+    lw.add_argument("--with-today", dest="with_today", action="store_true", help="also tail today's Tier-2 daily log")
+    lw.set_defaults(fn=cmd_learn_warm)
+    lnn = lns.add_parser("note", help="append a timestamped note to Tier-2 learning/<role>/YYYY-MM-DD.md")
+    lnn.add_argument("--role", required=True); lnn.add_argument("--text"); lnn.add_argument("--file")
+    lnn.add_argument("--by", help="author agent id")
+    lnn.set_defaults(fn=cmd_learn_note)
+    lnd = lns.add_parser("distill", help="retire@350k: append distilled learnings to BOTH Tier-1 brain AND Tier-2 dated log")
+    lnd.add_argument("--role", required=True); lnd.add_argument("--text"); lnd.add_argument("--file")
+    lnd.add_argument("--by", help="retiring agent id")
+    lnd.set_defaults(fn=cmd_learn_distill)
 
     args = ap.parse_args(); args.fn(args)
 
