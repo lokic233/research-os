@@ -1467,16 +1467,11 @@ def cmd_queue_submit(args):
                "kind": args.kind or "committee", "summary": args.summary or "", "priority": args.priority or 0}
     if Channel is not None:
         ch = _committee_channel(root)
-        r = ch.submit(payload, dedup_keys=["claim_id", "experiment_ids"])
-        # mirror Channel's id into queue_id for back-compat readers/printers
+        # ★ BUG-59: mirror queue_id INSIDE the channel lock (was a separate unlocked read-modify-write
+        # that could clobber a concurrent submit). submit() now writes queue_id atomically.
+        r = ch.submit(payload, dedup_keys=["claim_id", "experiment_ids"], mirror_id_key="queue_id")
         if r.get("dup"):
             print(f"↩︎ already queued as {r['id']} (claim {args.claim}, exps {exp_ids}) — not duplicating."); return
-        # mirror the channel id into queue_id for back-compat readers/printers
-        d = ch._read()
-        for it in d["queue"]:
-            if it.get("id") == r["id"]: it["queue_id"] = r["id"]
-        from channeling.channel import _dump as _chan_dump
-        _chan_dump(ch.path, d)
         qid = r["id"]
     else:
         q = load_yaml(_queue_path(root), {"queue": []}) or {"queue": []}
@@ -1517,15 +1512,10 @@ def cmd_queue_ack(args):
     root = inst_root(args); p = _queue_path(root)
     if Channel is not None:
         ch = _committee_channel(root)
-        # Channel.ack keys on native id; queue_id == id for v2-created items.
-        n = ch.ack(item_id=args.id, all_items=bool(args.all), by=args.by or "orchestrator", answer=args.answer or "")
-        # back-compat: also ack legacy items whose queue_id matches but lack a native id
-        if not args.all and n == 0:
-            d = ch._read(); 
-            for i in d["queue"]:
-                if not i.get("acked") and i.get("queue_id") == args.id:
-                    i["acked"] = True; i["acked_at"] = NOW(); i["acked_by"] = args.by or "orchestrator"; i["answer"] = args.answer or ""; n += 1
-            dump_yaml(p, d)
+        # Channel.ack keys on native id; queue_id == id for v2-created items. mirror_key='queue_id'
+        # (★ BUG-59) handles legacy items inside the lock — no separate unlocked read-modify-write.
+        n = ch.ack(item_id=args.id, all_items=bool(args.all), by=args.by or "orchestrator",
+                   answer=args.answer or "", mirror_key="queue_id")
     else:
         q = load_yaml(p, {"queue": []}) or {"queue": []}
         n = 0
