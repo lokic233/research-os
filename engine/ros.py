@@ -1915,7 +1915,8 @@ def cmd_cron_health(args):
     table = _cron_table(root)
     # optionally only check a subset (--cron monitor) — default = all configured crons
     only = getattr(args, "cron", None)
-    names = [only] if only else sorted(table.keys())
+    excl = set((getattr(args, "exclude", None) or "").split(",")) - {""}
+    names = [only] if only else [n for n in sorted(table.keys()) if n not in excl]
     rows = []; bad = []
     for name in names:
         spec = table.get(name, {"interval_min": 5, "alive_stale_x": 3})
@@ -2249,6 +2250,35 @@ def cmd_ceiling(args):
     print("\n✅ all ever-run agents under the ceiling.")
 
 
+def cmd_notify(args):
+    """v3 cron escalation primitive: drop a structured, action-flagged notification into a target queue.
+       --to orchestrator  -> runtime/orchestrator/inbox.yaml (research-workflow events; cmd_inbox reads it)
+       --to troubleshooter -> runtime/escalation/troubleshooter.yaml (system-health: main navi session)
+    Used by the deterministic crons (monitor -> troubleshooter for system-health #1-3 + itself; coordinator/
+    committee-health/proj-monitor -> orchestrator for research events). Idempotent via the Channel lock."""
+    root = inst_root(args); rd = runtime_dir(root)
+    target = (args.to or "orchestrator").lower()
+    rec = {"ts": NOW(), "agent": args.by or "cron", "role": args.role or "cron",
+           "event": args.event or "NOTE", "subject": args.subject or "",
+           "done": "", "doing": f"{args.event or 'NOTE'}: {args.subject or ''}".strip(),
+           "blocked": "", "need": args.detail or "", "next": "",
+           "claim": args.claim or "", "exp": args.exp or "", "project_id": args.project or "",
+           "needs_action": not args.info}
+    if target.startswith("trouble") or target in ("main", "navi", "main-navi"):
+        p = os.path.join(rd, "escalation", "troubleshooter.yaml"); idp = "ESC"; lk = "items"
+    else:
+        p = os.path.join(rd, "orchestrator", "inbox.yaml"); idp = "IN"; lk = "items"
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    if Channel is not None:
+        Channel(p, list_key=lk, id_prefix=idp).submit(rec)
+    else:
+        box = load_yaml(p, {lk: []}) or {lk: []}
+        box[lk].append({**rec, "acked": False})
+        dump_yaml(p, box)
+    flag = "INFO" if args.info else "❗ACTION"
+    print(f"📨 notified {target} [{flag}] {args.event or 'NOTE'}: {args.subject or ''}")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -2459,6 +2489,7 @@ def main():
     # ---- v3 MONITOR EYES (read-only) ----
     ch = sub.add_parser("cron-health", help="v3 monitor #1 (read-only): check runtime/cron/<job>.alive stamps; stale > alive_stale_x x interval = dead -> escalate troubleshooter")
     ch.add_argument("--cron", help="check only this cron (default: all configured crons)")
+    ch.add_argument("--exclude", help="comma-list of crons to skip (e.g. monitor, so the monitor doesn't self-flag; the MAIN NAVI session checks the monitor's own .alive)")
     ch.set_defaults(fn=cmd_cron_health)
     pg = sub.add_parser("progress", help="v3 monitor #4 (read-only): time-since-last-real-landing per in-flight claim (local-but-uncommitted / committee-done-no-verdict / gpu-result-not-resubmitted); > stall_min(20)/gpu_stall_min(30) -> notify orchestrator")
     pg.set_defaults(fn=cmd_progress)
@@ -2481,6 +2512,16 @@ def main():
     cl.add_argument("--agent", help="check just this agent id")
     cl.add_argument("--warn-pct", dest="warn_pct", type=float, help="warn band as %% of ceiling (default 85)")
     cl.set_defaults(fn=cmd_ceiling)
+    # ---- v3 cron escalation primitive ----
+    nt = sub.add_parser("notify", help="v3 cron escalation: drop a notification to --to orchestrator (research events) | troubleshooter (system-health, main navi)")
+    nt.add_argument("--to", help="orchestrator|troubleshooter (default orchestrator)")
+    nt.add_argument("--event", help="event tag, e.g. CRON_DEAD|WORK_NOT_LANDING|COMMITTEE_READY|FORWARD|RESEED|ADVANCE|GPU_DISPATCH|GPU_FAULT")
+    nt.add_argument("--subject", help="subject id (cron name / CLAIM-id / EXP-id / agent)")
+    nt.add_argument("--detail", help="human-readable detail / the action needed")
+    nt.add_argument("--by", help="notifying cron/agent id"); nt.add_argument("--role")
+    nt.add_argument("--claim"); nt.add_argument("--exp"); nt.add_argument("--project")
+    nt.add_argument("--info", action="store_true", help="informational only (not action-flagged)")
+    nt.set_defaults(fn=cmd_notify)
 
     args = ap.parse_args(); args.fn(args)
 
