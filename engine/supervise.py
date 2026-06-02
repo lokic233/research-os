@@ -195,3 +195,122 @@ def tree(H, root, *, grace_min=45):
         if a.get("agent_id"): a["_age"] = _age_min(a, now); agents.append(a)
     # only show non-terminal (live tree) by default
     return agents
+
+
+# ---------------- ATOMIC RETIRE -> SUCCESSOR (BUG-35/36/37) ----------------
+def retire(H, root, *, frm, to, project="", researcher_state="", seeder_state="",
+           open_work="", evidence_delta="", reseed_needed=False, by="", grace_min=45):
+    """ATOMIC sub-monitor/agent retirement. In ONE engine call:
+       1. register the successor `to` (inheriting role/project/parent/session edge) if not present
+       2. re-parent EVERY task assigned to `frm` -> `to`              (no orphaned researcher task)
+       3. re-parent EVERY agent supervised-by `frm` (parent==frm)     -> parent=`to`  (chain intact)
+       4. flip `frm` -> status:retired (+ retired_to edge)            (no lingering predecessor)
+       5. write a structured state-passing handoff artifact           (not heartbeat)
+       6. if reseed_needed -> notify orchestrator                     (dead seeder -> dispatch fresh)
+    Returns a dict report. Idempotent-ish: re-running is safe (already-retired frm is a no-op flip)."""
+    rd = H["runtime_dir"](root); now = H["NOW"]()
+    if frm == to:
+        raise SystemExit(f"❌ retire: successor must differ from predecessor (got {frm} -> {to}); "
+                         f"self-retire would brick the lane")
+    fp = os.path.join(rd, "agents", f"{frm}.yaml")
+    frec = H["load_yaml"](fp, {}) or {}
+    if not frec.get("agent_id"):
+        raise SystemExit(f"❌ retire: predecessor {frm} not found in runtime/agents")
+    # guard: refuse to clobber a DIFFERENT live agent occupying the successor id
+    tp0 = os.path.join(rd, "agents", f"{to}.yaml")
+    t0 = H["load_yaml"](tp0, {}) or {}
+    if t0.get("agent_id"):
+        same_role = t0.get("role", frec.get("role")) == frec.get("role", "sub-monitor")
+        t0_alive = t0.get("status") in ALIVE_STATES and _age_min(t0, _dt.datetime.now(_dt.timezone.utc)) <= grace_min
+        if t0_alive and (not same_role or t0.get("succeeds") not in (frm, None, "")):
+            raise SystemExit(f"❌ retire: successor id {to} already exists as a LIVE "
+                             f"{t0.get('role')} (status {t0.get('status')}) — refusing to clobber. "
+                             f"Pick a fresh successor id.")
+    # 1. register/refresh successor inheriting frm's edges
+    tp = os.path.join(rd, "agents", f"{to}.yaml")
+    trec = H["load_yaml"](tp, {}) or {}
+    inherited_parent = frec.get("parent", "") or ""
+    trec.update({
+        "agent_id": to, "role": frec.get("role", "sub-monitor"),
+        "backend": trec.get("backend", frec.get("backend", "")),
+        "node": trec.get("node", frec.get("node", "")),
+        "status": "running", "spawned_at": trec.get("spawned_at", now), "last_heartbeat": now,
+        "project_id": project or frec.get("project_id", ""),
+        "parent": inherited_parent,
+        "session_id": trec.get("session_id", ""),  # successor sets its own session via heartbeat/register
+        "current_claim_id": frec.get("current_claim_id", ""),
+        "current_exp_id": frec.get("current_exp_id", ""),
+        "heartbeat_count": int(trec.get("heartbeat_count", 0)),
+        "succeeds": frm, "note": f"successor to {frm}",
+    })
+    H["dump_yaml"](tp, trec)
+    # 2. re-parent every TASK assigned to frm -> to
+    moved_tasks = []
+    for t in task_list(H, root):
+        if t.get("assignee") == frm and t.get("status") not in ("done", "dropped"):
+            task_update(H, root, t["task_id"], assignee=to, status="active", by=frm,
+                        note=f"inherited on retire {frm}->{to}; researcher_state={researcher_state}")
+            moved_tasks.append(t["task_id"])
+        # also re-parent tasks whose PARENT was frm (the researcher tasks frm supervised)
+        elif t.get("parent") == frm and t.get("status") not in ("done", "dropped"):
+            p = _task_path(H, root, t["task_id"]); r = H["load_yaml"](p, {}) or {}
+            r["parent"] = to; r["updated_at"] = now
+            r.setdefault("history", []).append({"ts": now, "event": "reparent", "by": frm, "note": f"supervisor {frm}->{to}"})
+            H["dump_yaml"](p, r)
+            moved_tasks.append(t["task_id"] + "(reparent)")
+    # 3. re-parent every AGENT supervised-by frm (parent==frm) -> parent=to
+    moved_agents = []
+    for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
+        a = H["load_yaml"](fn, {}) or {}
+        if a.get("parent") == frm and a.get("agent_id") != to:
+            a["parent"] = to; a["last_parent_change"] = now
+            H["dump_yaml"](fn, a)
+            moved_agents.append(a.get("agent_id"))
+    # 4. flip frm -> retired
+    frec["status"] = "retired"; frec["retired_at"] = now; frec["retired_to"] = to
+    H["dump_yaml"](fp, frec)
+    # 5. structured handoff artifact
+    handoff(H, root, frm=frm, to=to, project=project or frec.get("project_id", ""),
+            researcher_state=researcher_state, seeder_state=seeder_state, open_work=open_work,
+            evidence_delta=evidence_delta, reseed_needed=reseed_needed, by=by or frm, task="")
+    return {"from": frm, "to": to, "moved_tasks": moved_tasks, "moved_agents": moved_agents,
+            "inherited_parent": inherited_parent, "reseed_needed": bool(reseed_needed)}
+
+
+# ---------------- HIERARCHICAL PROJECT MEMORY (area-3: avoid runtime overflow) ----------------
+def project_tree(H, root, *, grace_min=45, converged_pids=None):
+    """Compact hierarchical view: project -> live sub-monitor -> claim-seeders (active/retired).
+    Reads the COMMITTED registry (claims/agents/tasks), not full runtime histories, so a reader
+    never has to load every per-agent jsonl/buglog to know who owns what. Returns a nested dict."""
+    converged_pids = set(converged_pids or [])
+    rd = H["runtime_dir"](root); now = _dt.datetime.now(_dt.timezone.utc)
+    # index agents by project
+    agents = []
+    for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
+        a = H["load_yaml"](fn, {}) or {}
+        if a.get("agent_id"): a["_age"] = _age_min(a, now); agents.append(a)
+    # index claims by project (committed registry = durable memory)
+    claims_by_proj = {}
+    for fn in glob.glob(os.path.join(H["reg_dir"](root, "claims"), "**", "CLAIM-*.yaml"), recursive=True):
+        c = H["load_yaml"](fn, {}) or {}
+        cid = c.get("claim_id"); pid = c.get("project_id", "")
+        if cid:
+            claims_by_proj.setdefault(pid, []).append(
+                {"claim_id": cid, "status": c.get("status", "?"), "stage": c.get("stage", "?")})
+    out = {}
+    for d in sorted(glob.glob(os.path.join(root, "projects", "PROJ-*"))):
+        pid = os.path.basename(d)
+        conv = pid in converged_pids
+        sms = [a for a in agents if a.get("role") == "sub-monitor" and a.get("project_id") == pid]
+        live = [a for a in sms if a.get("status") in ALIVE_STATES and a["_age"] <= grace_min]
+        live.sort(key=lambda x: x["_age"])
+        researchers = [a for a in agents if a.get("role") == "researcher" and a.get("project_id") == pid]
+        live_res = [a for a in researchers if a.get("status") in ALIVE_STATES and a["_age"] <= grace_min]
+        out[pid] = {
+            "converged": conv,
+            "live_sub_monitor": (live[0].get("agent_id") if live else None),
+            "sub_monitor_generations": len(sms),
+            "live_researchers": [a.get("agent_id") for a in live_res],
+            "claims": claims_by_proj.get(pid, []),
+        }
+    return out

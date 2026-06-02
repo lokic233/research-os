@@ -410,9 +410,12 @@ def cmd_agent_register(args):
            "node": args.node or "", "status": "running", "spawned_at": NOW(),
            "last_heartbeat": NOW(), "current_claim_id": args.claim or "", "current_exp_id": args.exp or "",
            "project_id": getattr(args, "project", "") or "", "session_id": getattr(args, "session", "") or "",
+           "parent": getattr(args, "parent", "") or "",
            "gpu": getattr(args, "gpu", "") or "", "note": "", "heartbeat_count": 0}
     dump_yaml(os.path.join(d, f"{args.id}.yaml"), rec)
-    print(f"✅ agent {args.id} registered (role={args.role}). Heartbeat: `ros heartbeat --agent {args.id}` every ~{(_cfg(root).get('liveness') or {}).get('kick_interval_minutes',15)}m")
+    print(f"✅ agent {args.id} registered (role={args.role}"
+          + (f", parent={args.parent}" if getattr(args, 'parent', '') else "")
+          + f"). Heartbeat: `ros heartbeat --agent {args.id}` every ~{(_cfg(root).get('liveness') or {}).get('kick_interval_minutes',15)}m")
 
 def cmd_heartbeat(args):
     root = inst_root(args); rd = runtime_dir(root)
@@ -693,10 +696,19 @@ def cmd_submonitors(args):
             except Exception:
                 age = 1e9
             pid = a.get("project_id", "") or _infer_proj_from_id(aid)
-            # keep the freshest sub-monitor per project
+            # BUG-41 fix: prefer a LIVE sub-monitor over a retired/terminal one (status beats age).
+            # The old "freshest by age" logic false-flagged "retired-no-successor" whenever a sub-monitor
+            # retired in the SAME tick its successor registered (the just-retired r1 tied/beat the live r2).
+            st = a.get("status", "?")
+            alive = st not in ("completed", "retired", "failed", "dead", "superseded", "done", "dropped")
+            cand = {"id": aid, "status": st, "age": round(age, 1), "alive": alive}
             cur = sm_by_proj.get(pid)
-            if cur is None or age < cur["age"]:
-                sm_by_proj[pid] = {"id": aid, "status": a.get("status","?"), "age": round(age,1)}
+            def _better(new, old):
+                if old is None: return True
+                if new["alive"] != old["alive"]: return new["alive"]   # a live agent always wins
+                return new["age"] < old["age"]                          # within same liveness class, freshest
+            if _better(cand, cur):
+                sm_by_proj[pid] = cand
     need = []
     print(f"SUB-MONITOR DISCOVERY (kick={kick}m, grace={grace}m) — {len(projects)} active project(s)"
           + (f"; {len(converged_pids)} converged (no sub-monitor needed): {', '.join(converged_pids)}" if converged_pids else "") + ":")
@@ -786,9 +798,14 @@ def cmd_coordinators(args):
             age = 1e9
         # key on the agent's gpu_type tag; fall back to inferring from node or id
         gpu = a.get("gpu", "") or a.get("node", "") or _infer_gpu_from_id(aid)
+        # BUG-41 fix (mirror of submonitors): prefer a LIVE coordinator over a retired/terminal one.
+        st = a.get("status", "?")
+        alive = st not in ("completed", "retired", "failed", "dead", "superseded", "done", "dropped")
+        cand = {"id": aid, "status": st, "age": round(age, 1), "alive": alive}
         cur = coord_by_gpu.get(gpu)
-        if cur is None or age < cur["age"]:
-            coord_by_gpu[gpu] = {"id": aid, "status": a.get("status","?"), "age": round(age,1)}
+        if cur is None or (cand["alive"] != cur.get("alive", True) and cand["alive"]) or \
+           (cand["alive"] == cur.get("alive", True) and age < cur["age"]):
+            coord_by_gpu[gpu] = cand
     need = []
     print(f"GPU-COORDINATOR DISCOVERY (kick={kick}m, grace={grace}m) — {len(gpus)} GPU backend(s):")
     for n in gpus:
@@ -1540,6 +1557,43 @@ def cmd_tree(args):
         print("  (live agents with no parent edge:)")
         for a in orphans: print(f"    {_mark(a)} {a.get('agent_id')} [{a.get('status')}] {a.get('role','')}")
 
+def cmd_retire(args):
+    import supervise
+    root = inst_root(args); H = _sup_helpers(); cfg = _cfg(root)
+    grace = int((cfg.get("liveness", {}) or {}).get("patient_grace_minutes", 45))
+    rep = supervise.retire(H, root, frm=args.frm, to=args.to, project=args.project or "",
+                           researcher_state=args.researcher_state or "", seeder_state=args.seeder_state or "",
+                           open_work=args.open_work or "", evidence_delta=args.evidence_delta or "",
+                           reseed_needed=args.reseed_needed, by=args.by or "", grace_min=grace)
+    print(f"✅ RETIRED {rep['from']} -> {rep['to']} (atomic)")
+    print(f"   successor inherits parent={rep['inherited_parent'] or '(root)'}")
+    print(f"   tasks moved: {', '.join(rep['moved_tasks']) or '(none)'}")
+    print(f"   supervised agents re-parented: {', '.join(rep['moved_agents']) or '(none)'}")
+    if rep["reseed_needed"]:
+        print(f"   ⚠️ RESEED_NEEDED notified to orchestrator (dead seeder + open work)")
+
+def cmd_project_tree(args):
+    import supervise
+    root = inst_root(args); H = _sup_helpers(); cfg = _cfg(root)
+    grace = int((cfg.get("liveness", {}) or {}).get("patient_grace_minutes", 45))
+    conv = [os.path.basename(p) for p in glob.glob(os.path.join(root, "projects", "PROJ-*")) if _is_converged_project(p)]
+    tr = supervise.project_tree(H, root, grace_min=grace, converged_pids=conv)
+    print("PROJECT MEMORY TREE (project -> live sub-monitor -> claim-seeders; committed registry):")
+    for pid in sorted(tr):
+        v = tr[pid]
+        if v["converged"]:
+            print(f"  🏁 {pid} CONVERGED  (claims: {', '.join(c['claim_id'] for c in v['claims']) or '-'})")
+            continue
+        sm = v["live_sub_monitor"]
+        smflag = sm if sm else "❌ NONE (orchestrator must spawn)"
+        print(f"  📁 {pid}  sub-monitor={smflag}  (gens={v['sub_monitor_generations']})")
+        for c in v["claims"]:
+            print(f"        claim {c['claim_id']} [{c['status']}/{c['stage']}]")
+        if v["live_researchers"]:
+            print(f"        live researchers: {', '.join(v['live_researchers'])}")
+        elif not v["converged"]:
+            print(f"        live researchers: (none — below floor or work-gated)")
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -1621,6 +1675,7 @@ def main():
     agr.add_argument("--id", required=True); agr.add_argument("--role", required=True)
     agr.add_argument("--backend"); agr.add_argument("--node"); agr.add_argument("--claim"); agr.add_argument("--exp")
     agr.add_argument("--project", help="project this agent owns (sub-monitors/researchers)"); agr.add_argument("--session", help="this agent's own session id (for revival/handoff)")
+    agr.add_argument("--parent", help="supervising agent id (orchestrator for sub-monitors; sub-monitor for researchers) — builds the supervision tree")
     agr.add_argument("--gpu", help="gpu_type this agent coordinates (gpu_coordinator one-per-GPU keying, e.g. H100)")
     agr.set_defaults(fn=cmd_agent_register)
     hb = sub.add_parser("heartbeat")
@@ -1731,6 +1786,18 @@ def main():
     ho.set_defaults(fn=cmd_handoff)
     tr = sub.add_parser("tree"); tr.add_argument("--all", action="store_true", help="include terminal/retired agents")
     tr.set_defaults(fn=cmd_tree)
+    rt = sub.add_parser("retire", help="ATOMIC retire frm->to: register successor, re-parent tasks+supervised agents, flip frm retired, structured handoff")
+    rt.add_argument("--from", dest="frm", required=True); rt.add_argument("--to", required=True)
+    rt.add_argument("--project")
+    rt.add_argument("--researcher-state", dest="researcher_state", help="alive|dead|completed + detail of the monitored researcher")
+    rt.add_argument("--seeder-state", dest="seeder_state", help="state of the claim-seeder")
+    rt.add_argument("--open-work", dest="open_work"); rt.add_argument("--evidence-delta", dest="evidence_delta")
+    rt.add_argument("--reseed-needed", dest="reseed_needed", action="store_true",
+                    help="monitored researcher/seeder dead + work open -> notify orchestrator to dispatch fresh")
+    rt.add_argument("--by")
+    rt.set_defaults(fn=cmd_retire)
+    pt = sub.add_parser("project-tree", help="hierarchical project->sub-monitor->claim-seeder memory view (committed registry; no runtime overflow)")
+    pt.set_defaults(fn=cmd_project_tree)
 
     args = ap.parse_args(); args.fn(args)
 
