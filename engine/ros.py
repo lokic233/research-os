@@ -924,6 +924,14 @@ def cmd_lanes(args):
         open_claims = [c for c in cs if c.get("lifecycle_state") not in TERMINAL_LS and c.get("status") != "green"]
         evidence_ready = [c for c in cs if c.get("lifecycle_state") == "evidence_ready"
                           and c.get("claim_id") not in pending_claims]
+        # ★ a verdict_recorded (committee already ruled: yellow / needs-more-evidence) is NOT the same as a
+        # fresh drafted claim. RESEED? (spawn a new L0 researcher) is for claims with NO experiment yet;
+        # a verdict_recorded claim needs an ORCHESTRATOR ADVANCE decision (dispatch a TARGETED follow-up
+        # addressing the verdict's required_evidence, or accept the yellow as converged) — blindly
+        # reseeding it re-runs work the committee already saw. Classify them separately so the poller/
+        # orchestrator doesn't churn on yellows.
+        verdict_open = [c for c in open_claims if c.get("lifecycle_state") == "verdict_recorded"]
+        reseed_open  = [c for c in open_claims if c.get("lifecycle_state") != "verdict_recorded"]
         if evidence_ready:
             action = "FORWARD"
             detail = f"evidence_ready (not yet queued): {', '.join(c.get('claim_id','?') for c in evidence_ready)}"
@@ -933,17 +941,22 @@ def cmd_lanes(args):
         elif any(c.get('claim_id') in pending_claims for c in cs):
             action = "AWAIT"
             detail = "committee submission pending in queue"
-        elif open_claims:
+        elif reseed_open:
             action = "RESEED?"
-            detail = ("no live researcher + open work: "
-                      + ', '.join(f"{c.get('claim_id','?')}[{c.get('lifecycle_state','?')}]" for c in open_claims)
+            detail = ("no live researcher + un-experimented open work: "
+                      + ', '.join(f"{c.get('claim_id','?')}[{c.get('lifecycle_state','?')}]" for c in reseed_open)
                       + " — ORCHESTRATOR decides reseed (lane does NOT auto-respawn)")
+        elif verdict_open:
+            action = "ADVANCE?"
+            detail = ("verdict recorded, awaiting ORCHESTRATOR decision: "
+                      + ', '.join(f"{c.get('claim_id','?')}[{(c.get('verdict_history') or [{}])[-1].get('result','?')}]" for c in verdict_open)
+                      + " — dispatch TARGETED follow-up for required_evidence OR accept/converge (NOT a blind reseed)")
         else:
             action = "HOLD"
             detail = "below floor, no open work (correct; not a gap)"
-        mark = {"FORWARD":"📤","AWAIT":"⏳","RESEED?":"⚠️","HOLD":"·"}[action]
+        mark = {"FORWARD":"📤","AWAIT":"⏳","RESEED?":"⚠️","ADVANCE?":"🔬","HOLD":"·"}[action]
         print(f"  {mark} {pid}: {action} — {detail}")
-        if action in ("FORWARD","RESEED?"): actionable.append((pid, action, detail))
+        if action in ("FORWARD","RESEED?","ADVANCE?"): actionable.append((pid, action, detail))
     if actionable:
         print(f"\n{len(actionable)} actionable lane(s) for the poller:")
         for pid, act, det in actionable: print(f"   - {pid}: {act}")
