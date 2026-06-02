@@ -2063,6 +2063,26 @@ def cmd_progress(args):
     except Exception:
         pass
 
+    # index RUNNING GPU experiments by claim (BUG-71: a GPU exp dispatched + leased but whose result never
+    # landed — the run hung/died and the node stays leased forever — must be flagged. The result-channel
+    # check only catches a result that DID land; this catches the no-result-at-all case).
+    gpu_running_by_claim = {}
+    for ef in glob.glob(os.path.join(root, "experiments", "**", "experiment.yaml"), recursive=True):
+        ex = load_yaml(ef, {}) or {}
+        if not ex.get("needs_gpu"): continue
+        if (ex.get("status") or "") != "running": continue
+        if not ex.get("node_lease"): continue
+        if (ex.get("result_effect") or "").strip(): continue  # already has a result
+        try:
+            st = _dt.datetime.strptime(ex.get("started_at",""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+            age = (now - st).total_seconds()/60.0
+        except Exception:
+            age = 0.0
+        cidx = ex.get("claim_id","")
+        rec = {"age": age, "exp": ex.get("exp_id"), "lease": ex.get("node_lease")}
+        if cidx not in gpu_running_by_claim or age > gpu_running_by_claim[cidx]["age"]:
+            gpu_running_by_claim[cidx] = rec
+
     # index committee_run dirs that are ALL_COMMITTEE_DONE, keyed by any CLAIM-id in the dir name
     committee_done = {}  # claim_id -> {age, dir}
     for sd in glob.glob(os.path.join(rd, "committee_run_*")):
@@ -2151,6 +2171,14 @@ def cmd_progress(args):
             if not convening:
                 stalls.append((cid, pid, "committee-queued-not-convened", qage, stall_min,
                                "in committee queue, no committee convened (orchestrator idle?)"))
+
+        # (e) gpu-run-no-result (BUG-71): a GPU exp for this claim has been running+leased > gpu_stall_min
+        #     with NO result landed -> the run hung/died, node stuck leased -> notify orchestrator to
+        #     fault+release (ros exp dispatch --fault auto-releases) and re-dispatch.
+        gr_run = gpu_running_by_claim.get(cid)
+        if gr_run and gr_run["age"] > gpu_stall_min:
+            stalls.append((cid, pid, "gpu-run-no-result", gr_run["age"], gpu_stall_min,
+                           f"{gr_run['exp']} running+leased {gr_run['lease']}, no result — fault+release+re-dispatch"))
 
     print(f"PROGRESS — time-since-last-real-landing across {inflight} in-flight claim(s) "
           f"(stall>{stall_min:g}m, GPU>{gpu_stall_min:g}m):")
