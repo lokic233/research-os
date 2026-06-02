@@ -18,6 +18,22 @@ case "$mode" in
     echo "=== cron-health snapshot ==="
     "$PYBIN" "$HERE/../ros.py" --instance "$ROS_INSTANCE" cron-health
     ;;
+  loop)
+    # Single deterministic driver process (no OS cron/launchd needed): runs each cron on its interval.
+    # One process, no LLM, no sprawl. Dies on reboot — use launchd for durability. PID file for stop.
+    PIDF="$ROS_INSTANCE/runtime/cron/.driver.pid"
+    echo $$ > "$PIDF"
+    echo "v3 cron loop driver started (pid $$). committee_health=60s coordinator=120s monitor/proj=300s."
+    i=0
+    while :; do
+      # committee_health every 60s; coordinator every 120s; monitor + proj_monitor every 300s
+      ROS_INSTANCE="$ROS_INSTANCE" bash "$HERE/committee_health.sh" >> "$ROS_INSTANCE/runtime/cron/committee_health.log" 2>&1
+      [ $((i % 2))  -eq 0 ] && ROS_INSTANCE="$ROS_INSTANCE" bash "$HERE/coordinator.sh"  >> "$ROS_INSTANCE/runtime/cron/coordinator.log" 2>&1
+      [ $((i % 5))  -eq 0 ] && ROS_INSTANCE="$ROS_INSTANCE" bash "$HERE/proj_monitor.sh" >> "$ROS_INSTANCE/runtime/cron/proj_monitor.log" 2>&1
+      [ $((i % 5))  -eq 0 ] && ROS_INSTANCE="$ROS_INSTANCE" bash "$HERE/monitor.sh"      >> "$ROS_INSTANCE/runtime/cron/monitor.log" 2>&1
+      i=$((i + 1)); sleep 60
+    done
+    ;;
   crontab)
     echo "# v3 research-os crons (install with: crontab -e). All deterministic scripts."
     # cron runs with a minimal PATH (/usr/bin:/bin) — git lives in /usr/local/bin on this Mac, so set
@@ -33,5 +49,5 @@ case "$mode" in
     echo "# proj_monitor=300s committee_health=60s coordinator=120s monitor=300s; ProgramArguments=[bash, $HERE/<cron>.sh]"
     echo "# EnvironmentVariables: ROS_INSTANCE=$ROS_INSTANCE  (then launchctl load each). NOT installed by this script."
     ;;
-  *) echo "usage: drive.sh once|crontab|launchd"; exit 2;;
+  *) echo "usage: drive.sh once|loop|crontab|launchd"; exit 2;;
 esac
