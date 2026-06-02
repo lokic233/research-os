@@ -17,10 +17,12 @@ Data model (all YAML, atomic via ros.dump_yaml; stdlib + pyyaml only):
 This module is imported by ros.py; it reuses ros.py's helpers (load_yaml/dump_yaml/NOW/next_id/
 inst_root/runtime_dir/_cfg/reg_dir) passed in at call time to avoid a circular import.
 """
-import os, glob, json, datetime as _dt
+import os, re, glob, json, datetime as _dt
 
 TERMINAL = ("completed", "failed", "retired", "dead", "superseded", "done", "dropped")
 ALIVE_STATES = ("running", "active", "open")
+TASK_STATES = ("open", "active", "orphaned", "blocked", "done", "dropped")
+TASK_TERMINAL = ("done", "dropped")
 
 
 def _age_min(rec, now):
@@ -32,9 +34,33 @@ def _age_min(rec, now):
 
 
 # ---------------- TASK LEDGER ----------------
+def _alloc_task_id(H, root):
+    """BUG-43 fix: atomic incrementing TASK-id allocation. next_id (max-scan + write) RACES under
+    concurrent opens (5 parallel opens collided to 2 ids, losing 3 tasks). Here we claim the next id
+    by EXCLUSIVELY creating its file (O_CREAT|O_EXCL); on collision we bump and retry. Guarantees no
+    two writers ever get the same id."""
+    d = H["reg_dir"](root, "tasks"); os.makedirs(d, exist_ok=True)
+    # seed from current max
+    mx = 0
+    for fn in glob.glob(os.path.join(d, "TASK-*.yaml")):
+        m = re.search(r"TASK-(\d+)", os.path.basename(fn))
+        if m: mx = max(mx, int(m.group(1)))
+    n = mx + 1
+    while True:
+        tid = f"TASK-{n:04d}"; path = os.path.join(d, f"{tid}.yaml")
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.close(fd)               # claimed the id atomically (empty placeholder; caller fills it)
+            return tid, path
+        except FileExistsError:
+            n += 1                     # someone else took this id — bump and retry
+        if n > mx + 10000:
+            raise SystemExit("❌ task id allocation runaway")
+
+
 def task_open(H, root, *, kind, parent, assignee, project="", claim="", exp="", session="", summary=""):
-    """Allocate an incrementing TASK-id and write the task record. Returns task_id."""
-    tid = H["next_id"](root, "tasks", "TASK")
+    """Allocate an incrementing TASK-id (ATOMIC, race-safe) and write the task record. Returns task_id."""
+    tid, path = _alloc_task_id(H, root)
     now = H["NOW"]()
     obj = {
         "task_id": tid, "kind": kind, "parent": parent or "", "assignee": assignee or "",
@@ -43,8 +69,6 @@ def task_open(H, root, *, kind, parent, assignee, project="", claim="", exp="", 
         "evidence_delta": "", "opened_at": now, "updated_at": now, "closed_at": "",
         "history": [{"ts": now, "event": "open", "by": parent or "", "note": summary or ""}],
     }
-    path = os.path.join(H["reg_dir"](root, "tasks"), f"{tid}.yaml")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     H["dump_yaml"](path, obj)
     return tid, path
 
@@ -54,11 +78,18 @@ def _task_path(H, root, tid):
     return os.path.join(d, f"{tid}.yaml")
 
 
-def task_update(H, root, tid, *, assignee=None, status=None, session=None, evidence_delta=None, by="", note=""):
+def task_update(H, root, tid, *, assignee=None, status=None, session=None, evidence_delta=None, by="", note="", _internal=False):
     p = _task_path(H, root, tid)
     rec = H["load_yaml"](p, {}) or {}
     if not rec.get("task_id"):
         raise SystemExit(f"❌ {tid} not found")
+    # BUG-46 fix: validate status against the known set (a typo'd status silently corrupts the ledger).
+    if status is not None and status not in TASK_STATES:
+        raise SystemExit(f"❌ invalid task status '{status}'. Valid: {', '.join(TASK_STATES)}")
+    # BUG-47 fix: a terminal task (done/dropped) is immutable — refuse to reopen/mutate (except internal
+    # reaper bookkeeping which never targets terminal tasks anyway).
+    if rec.get("status") in TASK_TERMINAL and not _internal:
+        raise SystemExit(f"❌ {tid} is {rec.get('status')} (terminal) — cannot modify a closed task")
     now = H["NOW"]()
     if assignee is not None: rec["assignee"] = assignee
     if session is not None: rec["session_id"] = session
@@ -129,13 +160,31 @@ def reap(H, root, *, apply=False, grace_min=45, converged_pids=None):
             a2["status"] = new_status
             a2["reaped_at"] = H["NOW"]()
             a2["reaped_note"] = note
+            if new_status == "superseded" and succ:
+                a2["retired_to"] = succ.get("agent_id")
             H["dump_yaml"](a["_fn"], a2)
-            # orphan this agent's open tasks
+            # BUG-49 fix: if superseded, re-parent this agent's LIVE children to the live successor so
+            # the supervision tree doesn't fragment (a live researcher must hang off its live supervisor).
+            if new_status == "superseded" and succ:
+                succ_id = succ.get("agent_id")
+                for fn2 in glob.glob(os.path.join(rd, "agents", "*.yaml")):
+                    ch = H["load_yaml"](fn2, {}) or {}
+                    if ch.get("parent") == a.get("agent_id") and ch.get("agent_id") != succ_id:
+                        ch["parent"] = succ_id; ch["last_parent_change"] = H["NOW"]()
+                        H["dump_yaml"](fn2, ch)
+            # orphan this agent's open tasks (+ re-parent tasks parented by a superseded agent)
             for t in task_list(H, root):
                 if t.get("assignee") == a.get("agent_id") and t.get("status") in ("open", "active"):
                     task_update(H, root, t["task_id"], status="orphaned", by="reaper",
                                 note=f"assignee {a.get('agent_id')} {new_status}")
                     notifs.append(("TASK_ORPHANED", t["task_id"], t.get("project_id", "")))
+                elif (new_status == "superseded" and succ and t.get("parent") == a.get("agent_id")
+                      and t.get("status") not in ("done", "dropped")):
+                    p = _task_path(H, root, t["task_id"]); r = H["load_yaml"](p, {}) or {}
+                    r["parent"] = succ.get("agent_id"); r["updated_at"] = H["NOW"]()
+                    r.setdefault("history", []).append({"ts": H["NOW"](), "event": "reparent", "by": "reaper",
+                                                        "note": f"supervisor {a.get('agent_id')} superseded -> {succ.get('agent_id')}"})
+                    H["dump_yaml"](p, r)
             if new_status == "dead":
                 _notify(H, root, rd, kind="AGENT_DOWN",
                         agent=a.get("agent_id"), project=a.get("project_id", ""), role=a.get("role", ""),
@@ -180,9 +229,30 @@ def handoff(H, root, *, frm, to, project="", researcher_state="", seeder_state="
                     evidence_delta=evidence_delta, by=frm,
                     note=f"handoff: researcher={researcher_state}; seeder={seeder_state}; open={open_work}")
     if reseed_needed:
-        _notify(H, root, rd, kind="RESEED_NEEDED", agent=frm, project=project, role="researcher",
-                detail=f"seeder dead/ready-to-reseed: {seeder_state}; open_work={open_work}")
+        # BUG-48 fix: cross-check actual researcher liveness before asking for a fresh spawn — a blind
+        # RESEED_NEEDED could make the orchestrator double-spawn onto a still-live researcher (the exact
+        # corruption we fight). If a live researcher exists on this project, DOWNGRADE to a flagged warning.
+        live_res = _live_researchers(H, root, project, grace_min=45)
+        if live_res:
+            _notify(H, root, rd, kind="RESEED_CONFLICT", agent=frm, project=project, role="researcher",
+                    detail=f"reseed requested BUT live researcher(s) exist: {', '.join(live_res)} — "
+                           f"VERIFY before spawning (do NOT double-spawn). seeder_state={seeder_state}")
+            rec["reseed_conflict"] = live_res
+        else:
+            _notify(H, root, rd, kind="RESEED_NEEDED", agent=frm, project=project, role="researcher",
+                    detail=f"seeder dead/ready-to-reseed: {seeder_state}; open_work={open_work}")
     return rec
+
+
+def _live_researchers(H, root, project, *, grace_min=45):
+    """Live researcher agent-ids on a project (status alive + within grace). Used to prevent double-spawn."""
+    rd = H["runtime_dir"](root); now = _dt.datetime.now(_dt.timezone.utc); out = []
+    for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
+        a = H["load_yaml"](fn, {}) or {}
+        if (a.get("role") == "researcher" and a.get("project_id") == project
+                and a.get("status") in ALIVE_STATES and _age_min(a, now) <= grace_min):
+            out.append(a.get("agent_id"))
+    return out
 
 
 # ---------------- SUPERVISION TREE VIEW ----------------
@@ -270,11 +340,13 @@ def retire(H, root, *, frm, to, project="", researcher_state="", seeder_state=""
     frec["status"] = "retired"; frec["retired_at"] = now; frec["retired_to"] = to
     H["dump_yaml"](fp, frec)
     # 5. structured handoff artifact
-    handoff(H, root, frm=frm, to=to, project=project or frec.get("project_id", ""),
+    ho = handoff(H, root, frm=frm, to=to, project=project or frec.get("project_id", ""),
             researcher_state=researcher_state, seeder_state=seeder_state, open_work=open_work,
             evidence_delta=evidence_delta, reseed_needed=reseed_needed, by=by or frm, task="")
+    conflict = ho.get("reseed_conflict") if isinstance(ho, dict) else None
     return {"from": frm, "to": to, "moved_tasks": moved_tasks, "moved_agents": moved_agents,
-            "inherited_parent": inherited_parent, "reseed_needed": bool(reseed_needed)}
+            "inherited_parent": inherited_parent, "reseed_needed": bool(reseed_needed),
+            "reseed_conflict": conflict}
 
 
 # ---------------- HIERARCHICAL PROJECT MEMORY (area-3: avoid runtime overflow) ----------------

@@ -99,18 +99,52 @@ def _valid_date(date=None):
 
 def next_id(root, kind, prefix):
     """Next zero-padded id. Experiments live as experiments/<date>/<EXP-id>/ (dir names);
-    other objects as registry/<kind>/**/PREFIX-*.yaml. Scan the RIGHT place to avoid id reuse."""
-    mx = 0
-    if kind == "experiments":
-        for dn in glob.glob(os.path.join(root, "experiments", "**", f"{prefix}-*"), recursive=True):
-            m = re.search(rf"{prefix}-(\d+)", os.path.basename(dn.rstrip("/")))
-            if m: mx = max(mx, int(m.group(1)))
-    else:
-        d = reg_dir(root, kind); os.makedirs(d, exist_ok=True)
-        for fn in glob.glob(os.path.join(d, "**", f"{prefix}-*.yaml"), recursive=True):
-            m = re.search(rf"{prefix}-(\d+)", os.path.basename(fn))
-            if m: mx = max(mx, int(m.group(1)))
-    return f"{prefix}-{mx+1:04d}"
+    other objects as registry/<kind>/**/PREFIX-*.yaml. Scan the RIGHT place to avoid id reuse.
+
+    BUG-52 fix: the old (max-scan + return) was NON-ATOMIC — concurrent callers (two sub-monitors/
+    orchestrators seeding/verdicting at once) all saw the same max and returned the SAME id, then
+    silently clobbered each other (5 parallel `seed new` -> all CLAIM-0001, 4 lost). Now we serialize
+    allocation under a per-(root,kind) lockfile AND persist a reservation high-watermark, so an id is
+    never handed out twice even before the caller has written its file."""
+    import time as _t
+    rd = runtime_dir(root); lockdir = os.path.join(rd, "locks"); os.makedirs(lockdir, exist_ok=True)
+    lockpath = os.path.join(lockdir, f"next_id.{kind}.{prefix}.lock")
+    resv_path = os.path.join(lockdir, f"next_id.{kind}.{prefix}.reserved")
+    # acquire exclusive lock (spin with timeout; stale-lock break after 30s)
+    fd = None
+    for _ in range(600):
+        try:
+            fd = os.open(lockpath, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644); break
+        except FileExistsError:
+            try:
+                if _t.time() - os.path.getmtime(lockpath) > 30: os.unlink(lockpath); continue
+            except OSError: pass
+            _t.sleep(0.05)
+    try:
+        mx = 0
+        if kind == "experiments":
+            for dn in glob.glob(os.path.join(root, "experiments", "**", f"{prefix}-*"), recursive=True):
+                m = re.search(rf"{prefix}-(\d+)", os.path.basename(dn.rstrip("/")))
+                if m: mx = max(mx, int(m.group(1)))
+        else:
+            d = reg_dir(root, kind); os.makedirs(d, exist_ok=True)
+            for fn in glob.glob(os.path.join(d, "**", f"{prefix}-*.yaml"), recursive=True):
+                m = re.search(rf"{prefix}-(\d+)", os.path.basename(fn))
+                if m: mx = max(mx, int(m.group(1)))
+        # fold in the persisted reservation high-watermark (covers the window before caller writes its file)
+        try:
+            rv = int(open(resv_path).read().strip())
+        except Exception:
+            rv = 0
+        nxt = max(mx, rv) + 1
+        try:
+            with open(resv_path, "w") as f: f.write(str(nxt))
+        except OSError: pass
+        return f"{prefix}-{nxt:04d}"
+    finally:
+        if fd is not None:
+            try: os.close(fd); os.unlink(lockpath)
+            except OSError: pass
 
 def _fingerprint(text):
     """Normalized keyword set for cemetery dup detection."""
@@ -1569,7 +1603,10 @@ def cmd_retire(args):
     print(f"   successor inherits parent={rep['inherited_parent'] or '(root)'}")
     print(f"   tasks moved: {', '.join(rep['moved_tasks']) or '(none)'}")
     print(f"   supervised agents re-parented: {', '.join(rep['moved_agents']) or '(none)'}")
-    if rep["reseed_needed"]:
+    if rep.get("reseed_conflict"):
+        print(f"   ⚠️ RESEED_CONFLICT: live researcher(s) {', '.join(rep['reseed_conflict'])} exist — "
+              f"orchestrator must VERIFY before spawning (do NOT double-spawn)")
+    elif rep["reseed_needed"]:
         print(f"   ⚠️ RESEED_NEEDED notified to orchestrator (dead seeder + open work)")
 
 def cmd_project_tree(args):
