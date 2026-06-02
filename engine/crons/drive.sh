@@ -20,6 +20,9 @@ case "$mode" in
     ;;
   crontab)
     echo "# v3 research-os crons (install with: crontab -e). All deterministic scripts."
+    # cron runs with a minimal PATH (/usr/bin:/bin) — git lives in /usr/local/bin on this Mac, so set
+    # PATH explicitly or ros progress's git-based stall detection silently degrades.
+    echo "PATH=$(dirname "$(command -v git)"):/usr/local/bin:/usr/bin:/bin"
     echo "*/5 * * * * ROS_INSTANCE=$ROS_INSTANCE $HERE/proj_monitor.sh >> $ROS_INSTANCE/runtime/cron/proj_monitor.log 2>&1"
     echo "*/1 * * * * ROS_INSTANCE=$ROS_INSTANCE $HERE/committee_health.sh >> $ROS_INSTANCE/runtime/cron/committee_health.log 2>&1"
     echo "*/2 * * * * ROS_INSTANCE=$ROS_INSTANCE $HERE/coordinator.sh >> $ROS_INSTANCE/runtime/cron/coordinator.log 2>&1"

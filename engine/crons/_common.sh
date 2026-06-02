@@ -3,6 +3,9 @@
 # Contract: each cron drops runtime/cron/<job>.alive ON SUCCESS only (so ros cron-health can detect a
 # dead/stalled cron). A cron that errors must NOT stamp .alive (let it go stale -> monitor escalates).
 set -u
+# cron runs with a minimal PATH (/usr/bin:/bin). git lives in /usr/local/bin on this Mac; ensure it's
+# reachable so ros progress's git-based stall detection works under cron (belt-and-suspenders w/ crontab PATH).
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 : "${ROS_INSTANCE:?set ROS_INSTANCE to the instance root}"
 PYBIN="${ROS_PYTHON:-/usr/bin/python3}"
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
