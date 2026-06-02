@@ -520,7 +520,7 @@ def cmd_heartbeat(args):
     # v3 ever-run: carry the agent's cumulative token usage so the monitor + `ros ceiling` can see how
     # close it is to the 350k retire ceiling (agents do NOT self-kill at a context % anymore).
     if getattr(args, "tokens", None) is not None:
-        try: rec["tokens_used"] = int(args.tokens)
+        try: rec["tokens_used"] = max(0, int(args.tokens))
         except (TypeError, ValueError): pass
     dump_yaml(p, rec)
     print(f"💓 {args.agent} heartbeat #{rec['heartbeat_count']} ({rec.get('status','?')})")
