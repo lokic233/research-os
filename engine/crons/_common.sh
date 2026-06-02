@@ -19,7 +19,11 @@ if yaml:
 print(rd)
 PY
 }
-CRON_DIR="$(RUNTIME_DIR)/cron"
-mkdir -p "$CRON_DIR"
+_RD="$(RUNTIME_DIR)"
+# fail-fast: if the runtime dir couldn't be resolved (broken python / missing config), do NOT proceed —
+# a cron that can't locate runtime/cron must error out, never stamp .alive to the wrong place.
+if [ -z "$_RD" ] || [ "$_RD" = "/" ]; then echo "FATAL: cannot resolve runtime_dir" >&2; exit 1; fi
+CRON_DIR="$_RD/cron"
+mkdir -p "$CRON_DIR" || { echo "FATAL: cannot create $CRON_DIR" >&2; exit 1; }
 stamp_alive() { date -u +%Y-%m-%dT%H:%M:%SZ > "$CRON_DIR/$1.alive"; }   # call ONLY on success
 log() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
