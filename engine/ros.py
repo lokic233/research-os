@@ -1855,6 +1855,234 @@ def cmd_project_tree(args):
         elif not v["converged"]:
             print(f"        live researchers: (none — below floor or work-gated)")
 
+# ============================ v3 MONITOR EYES (read-only) ============================
+# Two net-new READ-ONLY commands the v3 deterministic monitor cron uses. Neither spawns nor mutates
+# anything — they compute and print state, exit non-zero when there is something to escalate.
+#
+#  ros cron-health  (monitor job #1) — every v3 cron drops runtime/cron/<job>.alive on a successful run.
+#                    This reads those stamps and flags any cron whose stamp is missing or stale (> N x its
+#                    configured interval). A dead/stalled cron => escalate to the troubleshooter (main navi).
+#
+#  ros progress     (monitor job #4, "work isn't landing") — time-since-last-REAL-progress per in-flight
+#                    claim, NOT just liveness. Distinguishes the v3 stall taxonomy's "work not landing":
+#                       local-but-uncommitted  : claim's registry file changed on disk but not committed
+#                       committee-done-no-verdict : committee_run _status==ALL_COMMITTEE_DONE but no verdict
+#                       gpu-result-not-resubmitted : a GPU result landed (channel) but not acked/advanced
+#                    Threshold: > stall_min (default 20) global; GPU stage > gpu_stall_min (default 30).
+#                    Over threshold => notify the ORCHESTRATOR to troubleshoot (exit 3).
+
+def _cron_table(root):
+    """v3 cron table from config (crons:). Each entry: interval_min + alive_stale_x. Falls back to the
+    design defaults if the key is absent (so the command works on any instance)."""
+    cfg = _cfg(root)
+    crons = cfg.get("crons") or {}
+    defaults = {
+        "monitor":          {"interval_min": 5, "alive_stale_x": 3},
+        "coordinator":      {"interval_min": 2, "alive_stale_x": 3},
+        "committee_health": {"interval_min": 1, "alive_stale_x": 3},
+        "proj_monitor":     {"interval_min": 5, "alive_stale_x": 3},
+    }
+    out = {}
+    for name, d in (crons or defaults).items():
+        d = d or {}
+        out[name] = {"interval_min": float(d.get("interval_min", defaults.get(name, {}).get("interval_min", 5))),
+                     "alive_stale_x": float(d.get("alive_stale_x", 3))}
+    return out
+
+def _alive_age_min(path, now):
+    """Age in minutes of a .alive stamp (mtime). Returns None if the stamp is missing."""
+    if not os.path.exists(path): return None
+    try:
+        import datetime as _dt
+        mt = _dt.datetime.fromtimestamp(os.path.getmtime(path), _dt.timezone.utc)
+        return (now - mt).total_seconds() / 60.0
+    except OSError:
+        return None
+
+def cmd_cron_health(args):
+    """★ v3 MONITOR JOB #1 (read-only): check every cron's runtime/cron/<job>.alive stamp. A stamp that
+    is MISSING or older than alive_stale_x x its interval => that cron is dead/stalled => escalate to the
+    TROUBLESHOOTER (main navi). Exits 3 if any cron is dead/stalled/never-started, 0 if all fresh."""
+    import datetime as _dt
+    root = inst_root(args); rd = runtime_dir(root)
+    cron_dir = os.path.join(rd, "cron")
+    now = _dt.datetime.now(_dt.timezone.utc)
+    table = _cron_table(root)
+    # optionally only check a subset (--cron monitor) — default = all configured crons
+    only = getattr(args, "cron", None)
+    names = [only] if only else sorted(table.keys())
+    rows = []; bad = []
+    for name in names:
+        spec = table.get(name, {"interval_min": 5, "alive_stale_x": 3})
+        interval = spec["interval_min"]; stale_x = spec["alive_stale_x"]
+        budget = interval * stale_x
+        stamp = os.path.join(cron_dir, f"{name}.alive")
+        age = _alive_age_min(stamp, now)
+        if age is None:
+            state = "NEVER_STARTED"; bad.append(name)
+        elif age > budget:
+            state = "STALE"; bad.append(name)
+        else:
+            state = "FRESH"
+        rows.append((name, state, age, interval, stale_x, budget))
+    print(f"CRON HEALTH — {len(names)} cron(s), runtime/cron/*.alive stamps:")
+    for name, state, age, interval, stale_x, budget in rows:
+        mark = {"FRESH": "💓", "STALE": "🔴", "NEVER_STARTED": "⚪"}[state]
+        agestr = f"{age:.1f}m" if age is not None else "—"
+        print(f"  {mark} {name:18} {state:13} age={agestr:>7}  (interval={interval:g}m, "
+              f"stale>{stale_x:g}x={budget:g}m)")
+    if bad:
+        print(f"\n🔴 {len(bad)} cron(s) DEAD/STALLED -> ESCALATE TO TROUBLESHOOTER (main navi): {', '.join(bad)}")
+        sys.exit(3)
+    print("\n✅ all crons fresh (every .alive within budget).")
+
+def _git_committed_clean(root, relpath):
+    """True if relpath has NO uncommitted changes (staged or unstaged) in the instance git repo.
+    Used to detect a 'local-but-uncommitted' claim (registry file changed on disk, not yet committed)."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", root, "status", "--porcelain", "--", relpath],
+                           capture_output=True, text=True, timeout=15)
+        return r.returncode == 0 and r.stdout.strip() == ""
+    except Exception:
+        return True  # can't tell -> don't false-flag
+
+def cmd_progress(args):
+    """★ v3 MONITOR JOB #4 (read-only, the important one — 'work isn't landing'): time-since-last-REAL
+    progress per in-flight claim. Distinguishes the v3 'work not landing' stalls from mere liveness:
+       local-but-uncommitted       — claim registry file modified on disk but not git-committed
+       committee-done-no-verdict    — committee_run _status==ALL_COMMITTEE_DONE but no verdict for the claim
+       gpu-result-not-resubmitted   — a GPU result landed in the channel (unacked) for the claim's exp
+    Threshold from config: progress.stall_min (default 20) global; progress.gpu_stall_min (default 30) for
+    the GPU stage. Over threshold => notify the ORCHESTRATOR (exit 3). A claim making normal forward motion
+    or fully committed/dispositioned is silent."""
+    import datetime as _dt
+    root = inst_root(args); rd = runtime_dir(root); cfg = _cfg(root)
+    pcfg = cfg.get("progress") or {}
+    stall_min = float(pcfg.get("stall_min", 20))
+    gpu_stall_min = float(pcfg.get("gpu_stall_min", 30))
+    now = _dt.datetime.now(_dt.timezone.utc)
+    TERMINAL_LS = ("done",)
+
+    # index pending committee-queue submissions (claim already forwarded) so we don't double-flag
+    pending_q = set()
+    try:
+        if Channel is not None:
+            for it in _committee_channel(root).list(include_acked=False):
+                if it.get("claim_id"): pending_q.add(it["claim_id"])
+    except Exception:
+        pass
+
+    # index unacked GPU results by exp_id (gpu-result-not-resubmitted)
+    gpu_results_by_exp = {}
+    try:
+        if Channel is not None:
+            for it in _gpu_result_channel(root).list(include_acked=False):
+                exp = it.get("exp_id")
+                if not exp: continue
+                try:
+                    sub_t = _dt.datetime.strptime(it.get("submitted_at",""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+                    age = (now - sub_t).total_seconds()/60.0
+                except Exception:
+                    age = 1e9
+                # keep the OLDEST unacked result per exp (worst-case stall)
+                if exp not in gpu_results_by_exp or age > gpu_results_by_exp[exp]["age"]:
+                    gpu_results_by_exp[exp] = {"age": age, "id": it.get("id"), "fault": it.get("fault")}
+    except Exception:
+        pass
+
+    # index committee_run dirs that are ALL_COMMITTEE_DONE, keyed by any CLAIM-id in the dir name
+    committee_done = {}  # claim_id -> {age, dir}
+    for sd in glob.glob(os.path.join(rd, "committee_run_*")):
+        if not os.path.isdir(sd): continue
+        status_f = os.path.join(sd, "_status.txt")
+        try:
+            status = open(status_f).read().strip()
+        except Exception:
+            continue
+        if status != "ALL_COMMITTEE_DONE": continue
+        m = re.search(r"(CLAIM-\d+)", os.path.basename(sd))
+        if not m: continue
+        cid = m.group(1)
+        try:
+            age = (now - _dt.datetime.fromtimestamp(os.path.getmtime(status_f), _dt.timezone.utc)).total_seconds()/60.0
+        except OSError:
+            age = 1e9
+        if cid not in committee_done or age < committee_done[cid]["age"]:
+            committee_done[cid] = {"age": age, "dir": os.path.basename(sd)}
+
+    # index existing verdicts by claim, tracking the NEWEST verdict-file mtime (for two-pass: a verdict
+    # from committee pass #1 must NOT mask a pass #2 run that finished later with no new verdict).
+    verdicts_by_claim = {}  # claim_id -> newest verdict file mtime (epoch)
+    for fn in glob.glob(reg_dir(root, "verdicts", "**", "VERDICT-*.yaml"), recursive=True):
+        v = load_yaml(fn, {}) or {}
+        cid = v.get("claim_id")
+        if not cid: continue
+        try:
+            mt = os.path.getmtime(fn)
+        except OSError:
+            mt = 0
+        if cid not in verdicts_by_claim or mt > verdicts_by_claim[cid]:
+            verdicts_by_claim[cid] = mt
+
+    stalls = []
+    inflight = 0
+    for fn in glob.glob(reg_dir(root, "claims", "**", "CLAIM-*.yaml"), recursive=True):
+        c = load_yaml(fn, {}) or {}
+        ls = c.get("lifecycle_state", "drafted")
+        if ls in TERMINAL_LS or c.get("status") == "green": continue
+        cid = c.get("claim_id", "?"); pid = c.get("project_id", "?")
+        inflight += 1
+        relpath = os.path.relpath(fn, root)
+
+        # (a) local-but-uncommitted: claim file dirty in git + dirty for > stall_min
+        if not _git_committed_clean(root, relpath):
+            try:
+                age = (now - _dt.datetime.fromtimestamp(os.path.getmtime(fn), _dt.timezone.utc)).total_seconds()/60.0
+            except OSError:
+                age = 1e9
+            if age > stall_min:
+                stalls.append((cid, pid, "local-but-uncommitted", age, stall_min,
+                               f"{relpath} modified on disk, not committed"))
+
+        # (b) committee-done-no-verdict: ALL_COMMITTEE_DONE run exists, but no verdict written SINCE it
+        #     finished (two-pass aware: compare committee-run finish mtime vs the newest verdict mtime).
+        cd = committee_done.get(cid)
+        if cd:
+            try:
+                done_mt = os.path.getmtime(os.path.join(rd, cd["dir"], "_status.txt"))
+            except OSError:
+                done_mt = 0
+            verdict_mt = verdicts_by_claim.get(cid, 0)
+            resolved = verdict_mt >= done_mt  # a verdict written at/after this committee run resolves it
+            if cd["age"] > stall_min and not resolved:
+                stalls.append((cid, pid, "committee-done-no-verdict", cd["age"], stall_min,
+                               f"{cd['dir']} ALL_COMMITTEE_DONE, no verdict written since"))
+
+        # (c) gpu-result-not-resubmitted: any of the claim's active/cited exps has an unacked GPU result
+        exps = list(c.get("active_experiments", []) or [])
+        for se in (c.get("supporting_evidence", []) or []):
+            if se.get("exp_id"): exps.append(se["exp_id"])
+        for exp in set(exps):
+            gr = gpu_results_by_exp.get(exp)
+            if gr and gr["age"] > gpu_stall_min:
+                faulttag = " (FAULT)" if gr.get("fault") else ""
+                stalls.append((cid, pid, "gpu-result-not-resubmitted", gr["age"], gpu_stall_min,
+                               f"{exp} result {gr['id']} unacked{faulttag}"))
+
+    print(f"PROGRESS — time-since-last-real-landing across {inflight} in-flight claim(s) "
+          f"(stall>{stall_min:g}m, GPU>{gpu_stall_min:g}m):")
+    if not stalls:
+        print("✅ no work-not-landing stalls (every in-flight claim is committed / progressing / dispositioned).")
+        return
+    # worst first
+    stalls.sort(key=lambda s: s[3], reverse=True)
+    for cid, pid, kind, age, thr, detail in stalls:
+        print(f"  🔴 {cid} ({pid}) {kind}: {age:.1f}m > {thr:g}m — {detail}")
+    print(f"\n🔴 {len(stalls)} stall(s) -> NOTIFY ORCHESTRATOR to troubleshoot (work not landing).")
+    sys.exit(3)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -2061,6 +2289,12 @@ def main():
     rt.set_defaults(fn=cmd_retire)
     pt = sub.add_parser("project-tree", help="hierarchical project->sub-monitor->claim-seeder memory view (committed registry; no runtime overflow)")
     pt.set_defaults(fn=cmd_project_tree)
+    # ---- v3 MONITOR EYES (read-only) ----
+    ch = sub.add_parser("cron-health", help="v3 monitor #1 (read-only): check runtime/cron/<job>.alive stamps; stale > alive_stale_x x interval = dead -> escalate troubleshooter")
+    ch.add_argument("--cron", help="check only this cron (default: all configured crons)")
+    ch.set_defaults(fn=cmd_cron_health)
+    pg = sub.add_parser("progress", help="v3 monitor #4 (read-only): time-since-last-real-landing per in-flight claim (local-but-uncommitted / committee-done-no-verdict / gpu-result-not-resubmitted); > stall_min(20)/gpu_stall_min(30) -> notify orchestrator")
+    pg.set_defaults(fn=cmd_progress)
 
     args = ap.parse_args(); args.fn(args)
 
