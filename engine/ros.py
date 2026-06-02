@@ -1296,13 +1296,44 @@ def cmd_verdict_write(args):
     cfg=_cfg(root); comm=cfg.get("committee",{}) or {}
     members=comm.get("members",[]) or []; rule=comm.get("green_rule","unanimous")
     if args.final in ("green","promote") and not args.override_rule:
-        nmembers=len(members) or 6
-        vals=[ (p.get("vote") or "").lower() for p in parsed ]
-        if len(parsed) < nmembers:
-            sys.exit(f"❌ green_rule={rule}: {args.final} needs all {nmembers} committee votes via --votes; "
-                     f"got {len(parsed)}. (use --override-rule only with explicit justification.)")
-        if rule=="unanimous" and any(v!="green" for v in vals):
-            sys.exit(f"❌ green_rule=unanimous: every vote must be green for a {args.final} verdict; got {vals}.")
+        # ★ BUG-56/57 FIX (scientific-integrity gate): a green/promote requires EVERY configured committee
+        # MEMBER (by role name) to be present and green — NOT merely len(votes)>=N. The old count-only
+        # check let a vote slate (a) duplicate one role to pad the count, (b) OMIT area_chair=FINAL_VERDICT,
+        # or (c) use bogus/typo'd role names — all silently sailing through as "6/6 green". The gate now
+        # validates the EXACT configured member set is covered, each role appears once, each votes green,
+        # and no unknown roles are present. The configured member list is the source of truth.
+        member_roles=[ (m.get("role") or "").strip() for m in members if (m.get("role") or "").strip() ]
+        if not member_roles: member_roles=["novelty_killer","systems_reviewer","evaluation_prosecutor",
+                                           "theory_skeptic","product_realist","area_chair"]
+        nmembers=len(member_roles)
+        # normalize parsed roles/votes
+        vote_by_role={}
+        dup_roles=[]
+        for p in parsed:
+            r=(p.get("role") or "").strip()
+            v=(p.get("vote") or "").strip().lower()
+            if not r:
+                sys.exit(f"❌ green_rule={rule}: a vote is missing its role (need role:vote). got slate {votes}.")
+            if r in vote_by_role: dup_roles.append(r)
+            vote_by_role[r]=v
+        if dup_roles:
+            sys.exit(f"❌ green_rule={rule}: duplicate vote(s) for role(s) {sorted(set(dup_roles))} — each "
+                     f"committee member votes exactly once. Cannot pad a {args.final} with repeated roles.")
+        missing=[r for r in member_roles if r not in vote_by_role]
+        if missing:
+            sys.exit(f"❌ green_rule={rule}: {args.final} needs a vote from EVERY committee member; "
+                     f"missing {missing}. (configured members: {member_roles}; "
+                     f"use --override-rule only with explicit justification.)")
+        unknown=[r for r in vote_by_role if r not in member_roles]
+        if unknown:
+            sys.exit(f"❌ green_rule={rule}: unknown role(s) {unknown} are not configured committee members "
+                     f"{member_roles} — a {args.final} verdict must come from the real committee, not "
+                     f"arbitrary roles. (use --override-rule only with explicit justification.)")
+        if rule=="unanimous":
+            non_green=[f"{r}:{vote_by_role[r]}" for r in member_roles if vote_by_role[r]!="green"]
+            if non_green:
+                sys.exit(f"❌ green_rule=unanimous: every member must vote green for a {args.final} verdict; "
+                         f"non-green: {non_green}.")
     # BUG-18 fix: idempotency — if an identical verdict (same claim+experiments+final) already exists,
     # do NOT create a duplicate (guards against harness/transport retries of the same tool call).
     if not getattr(args, "allow_dup", False):
