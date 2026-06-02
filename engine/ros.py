@@ -299,6 +299,19 @@ def cmd_exp_complete(args):
                 ag["completed_note"] = f"EXP {args.exp} terminal ({args.effect}); researcher work done"
                 dump_yaml(ap, ag)
                 print(f"   researcher {owner} -> completed (EXP-terminal; not a reap-DEAD false-flag)")
+                # ★ BUG-60b: close this researcher's OPEN tasks (the work they represent is done) so the
+                # task ledger doesn't accumulate stale-open tasks for finished researchers. Done via the
+                # supervise helper (validates + appends history). Failures here are non-fatal (best-effort).
+                try:
+                    import supervise as _sup; _H=_sup_helpers()
+                    for _t in _sup.task_list(_H, root):
+                        if _t.get("assignee")==owner and _t.get("status") in ("open","active"):
+                            _sup.task_update(_H, root, _t["task_id"], status="done", by="exp-complete",
+                                             note=f"assignee {owner} completed EXP {args.exp} ({args.effect})",
+                                             _internal=True)
+                            print(f"   closed task {_t['task_id']} (assignee {owner} done)")
+                except Exception as _e:
+                    pass
     # BUG-54 fix: release the GPU node lease this exp held (dispatch recorded it). Without this the node
     # stays leased forever after the exp completes -> all future dispatches refused / node looks BUSY.
     _lease = exp.get("node_lease", "")
