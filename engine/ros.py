@@ -1362,6 +1362,21 @@ def cmd_verdict_write(args):
     claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final})
     if args.final in ("promote","kill"):
         claim["lifecycle_state"]="done"; claim["next_action"]=f"{args.final}ed by {vid}"
+        # ★ BUG-58b: mirror the claim STATUS on promote/kill so it matches the exp_complete path (which
+        # sets status promoted/dead). Without this, a promote verdict left status='seed' on a top result,
+        # and the BUG-25 promoted-claim demote-guard (which keys on status=='promoted') never engaged.
+        if args.final=="promote": claim["status"]="promoted"
+        else: claim["status"]="dead"
+    elif args.final=="green":
+        # ★ BUG-58 FIX: a GREEN verdict PASSED committee (real 6/6). The old code reused the yellow/red
+        # message ("address required_evidence to advance"), which made every green claim linger in `ros
+        # resume` telling the orchestrator to fix evidence it had already cleared — nonsensical for a pass.
+        # A green is the success milestone but NOT auto-terminal (green-lift / promote may follow), so we
+        # mark a green-specific lifecycle + status + an honest next_action, WITHOUT forcing 'done'.
+        claim["lifecycle_state"]="verdict_recorded"
+        claim["status"]="green"
+        claim["next_action"]=(f"{vid}=GREEN (6/6 committee): promote (ros verdict --final promote) "
+                              f"or close; any green-lift/follow-on is optional, not required")
     else:
         claim["lifecycle_state"]="verdict_recorded"
         claim["next_action"]=f"{vid}={args.final}: address required_evidence to advance"
