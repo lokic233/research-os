@@ -927,10 +927,33 @@ def cmd_lanes(args):
         if alive: cur["alive"].append((aid, st, round(age,1)))
     # pending committee-queue submissions by claim
     pending_claims = set()
+    # ★ BUG-70: a claim whose committee was ALREADY FORWARDED+ACKED (convened/running) but whose
+    # verdict is not yet written still sits in lifecycle_state=evidence_ready. The old FORWARD gate
+    # (evidence_ready AND not in pending_claims) only excluded UNACKED queue items, so once the
+    # orchestrator acked the submission (convened the committee) the claim re-qualified for FORWARD ->
+    # proj-monitor double-forwarded it (stale Q), which the orchestrator then recorded as a duplicate
+    # verdict via --allow-dup (verdict inflation: one committee run -> two VERDICT records). Track
+    # ALL forwarded claims (acked included) + any in-flight committee run dir, and treat them as AWAIT.
+    forwarded_claims = set()
     try:
         if Channel is not None:
-            for it in _committee_channel(root).list(include_acked=False):
-                if it.get("claim_id"): pending_claims.add(it["claim_id"])
+            for it in _committee_channel(root).list(include_acked=True):
+                cid = it.get("claim_id")
+                if not cid: continue
+                forwarded_claims.add(cid)
+                if not it.get("acked"): pending_claims.add(cid)
+    except Exception:
+        pass
+    # a committee run in progress (experiments/**/<EXP>/committee*/) for the claim's evidence also
+    # means "already forwarded, awaiting verdict" — resolve EXP -> claim and mark forwarded.
+    try:
+        for cdir in glob.glob(os.path.join(root, "experiments", "**", "committee*"), recursive=True):
+            m = re.search(r"(EXP-\d+)", cdir)
+            if not m: continue
+            for ef in glob.glob(os.path.join(root, "experiments", "**", m.group(1), "experiment.yaml"), recursive=True):
+                ex = load_yaml(ef, {}) or {}
+                if ex.get("claim_id"): forwarded_claims.add(ex["claim_id"])
+                break
     except Exception:
         pass
     # in-flight claims by project (lifecycle from registry)
@@ -948,7 +971,8 @@ def cmd_lanes(args):
         # the lane's "open work" = any non-terminal, non-green in-flight claim
         open_claims = [c for c in cs if c.get("lifecycle_state") not in TERMINAL_LS and c.get("status") != "green"]
         evidence_ready = [c for c in cs if c.get("lifecycle_state") == "evidence_ready"
-                          and c.get("claim_id") not in pending_claims]
+                          and c.get("claim_id") not in pending_claims
+                          and c.get("claim_id") not in forwarded_claims]
         # ★ a verdict_recorded (committee already ruled: yellow / needs-more-evidence) is NOT the same as a
         # fresh drafted claim. RESEED? (spawn a new L0 researcher) is for claims with NO experiment yet;
         # a verdict_recorded claim needs an ORCHESTRATOR ADVANCE decision (dispatch a TARGETED follow-up
@@ -966,6 +990,13 @@ def cmd_lanes(args):
         elif any(c.get('claim_id') in pending_claims for c in cs):
             action = "AWAIT"
             detail = "committee submission pending in queue"
+        elif any(c.get('claim_id') in forwarded_claims and c.get('lifecycle_state') == 'evidence_ready' for c in cs):
+            # ★ BUG-70: committee already convened/running for this evidence; verdict not yet written.
+            # NOT a FORWARD (would re-queue a stale dup) and NOT a RESEED? (committee is live).
+            action = "AWAIT"
+            detail = ("committee convened, verdict pending: "
+                      + ', '.join(c.get('claim_id','?') for c in cs
+                                  if c.get('claim_id') in forwarded_claims and c.get('lifecycle_state') == 'evidence_ready'))
         elif reseed_open:
             action = "RESEED?"
             detail = ("no live researcher + un-experimented open work: "
