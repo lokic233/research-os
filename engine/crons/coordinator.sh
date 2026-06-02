@@ -19,12 +19,19 @@ echo "$pend" | grep -oE 'EXP-[0-9]+' | sort -u | while read -r exp; do
     fi
   done
 done
-# fault recovery: any faulted lease -> the engine's --fault path already auto-released; surface to orchestrator
+# fault recovery: any faulted lease -> the engine's --fault path already auto-released; surface to
+# orchestrator ONCE per fault-set (re-fires only if the set of faulted results changes — no 2-min churn).
 faults="$(ROS gpu-result list 2>/dev/null | grep -i 'FAULT' || true)"
+NDIR="$CRON_DIR/.coord_notified"; mkdir -p "$NDIR"; mk="$NDIR/gpu_fault"
 if [ -n "$faults" ]; then
-  ROS notify --to orchestrator --event GPU_FAULT --subject "gpu" \
-    --detail "$(echo "$faults" | head -4 | tr '\n' ';')" --by coordinator --role coordinator >/dev/null || rc=1
-  log "GPU_FAULT surfaced to orchestrator"
+  fset="$(echo "$faults" | grep -oE 'GR-[0-9]+' | sort | tr '\n' ';')"
+  if [ ! -f "$mk" ] || [ "$(cat "$mk")" != "$fset" ]; then
+    ROS notify --to orchestrator --event GPU_FAULT --subject "gpu" \
+      --detail "$(echo "$faults" | head -4 | tr '\n' ';')" --by coordinator --role coordinator >/dev/null || rc=1
+    printf '%s' "$fset" > "$mk"; log "GPU_FAULT surfaced to orchestrator"
+  fi
+else
+  rm -f "$mk"   # no faults -> clear so a future fault re-surfaces
 fi
 # success (ran cleanly) -> stamp .alive even if there was no GPU work (silent is healthy).
 [ "$rc" -eq 0 ] && stamp_alive coordinator
