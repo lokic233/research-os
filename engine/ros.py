@@ -517,6 +517,11 @@ def cmd_heartbeat(args):
     if getattr(args, "project", None): rec["project_id"] = args.project
     if getattr(args, "session", None): rec["session_id"] = args.session
     if getattr(args, "gpu", None): rec["gpu"] = args.gpu
+    # v3 ever-run: carry the agent's cumulative token usage so the monitor + `ros ceiling` can see how
+    # close it is to the 350k retire ceiling (agents do NOT self-kill at a context % anymore).
+    if getattr(args, "tokens", None) is not None:
+        try: rec["tokens_used"] = int(args.tokens)
+        except (TypeError, ValueError): pass
     dump_yaml(p, rec)
     print(f"💓 {args.agent} heartbeat #{rec['heartbeat_count']} ({rec.get('status','?')})")
 
@@ -2188,6 +2193,62 @@ def cmd_learn_distill(args):
         pass
 
 
+def _token_ceiling(cfg):
+    """v3 HARD retire ceiling (tokens). Ever-run agents do NOT self-kill at a context %; they run until
+    this many cumulative tokens, then distill -> ONE successor. globals.retire_at_token_ceiling (350k)."""
+    g = (cfg.get("globals") or {}).get("retire_at_token_ceiling")
+    try: return int(g) if g is not None else 350000
+    except (TypeError, ValueError): return 350000
+
+def cmd_ceiling(args):
+    """★ v3 EVER-RUN CONTRACT (read-only): report which long-running agents are AT or NEAR the hard 350k
+    token retire ceiling. An ever-run agent (orchestrator/researcher) does NOT self-kill at a context %;
+    it runs long and, on crossing the ceiling, MUST: (1) `ros learn distill --role <fam>` the most-valuable
+    learnings to BOTH tiers, then (2) hand to exactly ONE successor via `ros retire --from <self> --to
+    <successor>` (atomic; passes state). Exits 3 if any agent is at/over the ceiling (loop should retire),
+    1 if any is in the warn band (>= warn_pct of ceiling), else 0. --agent checks just one."""
+    import datetime as _dt
+    root = inst_root(args); rd = runtime_dir(root); cfg = _cfg(root)
+    ceiling = _token_ceiling(cfg)
+    warn_pct = float(getattr(args, "warn_pct", None) or 85)
+    warn_at = ceiling * warn_pct / 100.0
+    only = getattr(args, "agent", None)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    grace = int((cfg.get("liveness", {}) or {}).get("patient_grace_minutes", 45))
+    rows = []; over = []; warn = []
+    files = [os.path.join(rd, "agents", f"{only}.yaml")] if only else glob.glob(os.path.join(rd, "agents", "*.yaml"))
+    for fn in files:
+        a = load_yaml(fn, {}) or {}
+        aid = a.get("agent_id")
+        if not aid: continue
+        st = a.get("status", "?")
+        # only EVER-RUN, still-live agents matter (terminal ones already handed off)
+        if st in ("completed", "retired", "failed", "dead", "superseded", "done", "dropped"): continue
+        fam = _role_family(a.get("role", aid))
+        # only long-running role families have a ceiling (researchers + orchestrator); skip ephemeral crons
+        toks = int(a.get("tokens_used", 0) or 0)
+        pct = (toks / ceiling * 100.0) if ceiling else 0.0
+        state = "OVER" if toks >= ceiling else ("WARN" if toks >= warn_at else "OK")
+        if state == "OVER": over.append(aid)
+        elif state == "WARN": warn.append(aid)
+        rows.append((aid, fam, toks, pct, state))
+    rows.sort(key=lambda r: r[2], reverse=True)
+    print(f"CEILING — ever-run token usage vs hard retire ceiling {ceiling:,} (warn>={warn_pct:g}%):")
+    if not rows:
+        print("  (no live ever-run agents reporting tokens)")
+    for aid, fam, toks, pct, state in rows:
+        mark = {"OVER": "🔴", "WARN": "🟡", "OK": "💚"}[state]
+        print(f"  {mark} {aid:28} {fam:12} {toks:>8,} tok ({pct:5.1f}%) {state}")
+    if over:
+        print(f"\n🔴 {len(over)} agent(s) AT/OVER ceiling -> MUST distill (`ros learn distill`) + retire to "
+              f"ONE successor (`ros retire`): {', '.join(over)}")
+        sys.exit(3)
+    if warn:
+        print(f"\n🟡 {len(warn)} agent(s) in warn band -> plan a clean retire checkpoint soon: {', '.join(warn)}")
+        sys.exit(1)
+    print("\n✅ all ever-run agents under the ceiling.")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -2276,6 +2337,7 @@ def main():
     hb.add_argument("--agent", required=True); hb.add_argument("--status"); hb.add_argument("--note")
     hb.add_argument("--role"); hb.add_argument("--claim"); hb.add_argument("--exp")
     hb.add_argument("--project"); hb.add_argument("--session"); hb.add_argument("--gpu")
+    hb.add_argument("--tokens", type=int, help="v3 ever-run: cumulative tokens used (for the 350k retire ceiling / ros ceiling)")
     hb.set_defaults(fn=cmd_heartbeat)
     sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
     sub.add_parser("submonitors").set_defaults(fn=cmd_submonitors)
@@ -2414,6 +2476,11 @@ def main():
     lnd.add_argument("--role", required=True); lnd.add_argument("--text"); lnd.add_argument("--file")
     lnd.add_argument("--by", help="retiring agent id")
     lnd.set_defaults(fn=cmd_learn_distill)
+    # ---- v3 EVER-RUN CONTRACT: token ceiling check ----
+    cl = sub.add_parser("ceiling", help="v3 ever-run (read-only): which agents are at/near the 350k token retire ceiling -> distill + retire to ONE successor")
+    cl.add_argument("--agent", help="check just this agent id")
+    cl.add_argument("--warn-pct", dest="warn_pct", type=float, help="warn band as %% of ceiling (default 85)")
+    cl.set_defaults(fn=cmd_ceiling)
 
     args = ap.parse_args(); args.fn(args)
 
