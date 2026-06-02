@@ -570,6 +570,13 @@ def cmd_exp_dispatch(args):
     if not node: sys.exit(f"❌ node '{args.node}' not in config compute_nodes.")
     budget = exp.get("resource_budget", {})
     floor = budget.get("host_mem_floor_gb", 0) or 0
+    # SAFETY GATE: gpu_type match — never dispatch an exp to a node of the WRONG GPU type (e.g. an
+    # H100-required exp onto the fragile MI350X). Exp gpu_type 'any'/empty = no constraint. --force overrides.
+    exp_gt = (exp.get("gpu_type") or "").strip()
+    node_gt = (node.get("gpu_type") or "").strip()
+    if exp_gt and exp_gt.lower() not in ("any", "") and node_gt and exp_gt.lower() != node_gt.lower() and not args.force:
+        sys.exit(f"❌ SAFETY: exp {args.exp} requires gpu_type '{exp_gt}' but node '{args.node}' is "
+                 f"'{node_gt}' — refusing GPU-type mismatch (protects the fragile node). Use a matching node or --force.")
     # SAFETY GATE
     if node.get("fragile") and floor <= 0:
         sys.exit(f"❌ SAFETY: node '{args.node}' is fragile and exp {args.exp} has no host_mem_floor_gb. "
