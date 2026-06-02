@@ -896,12 +896,25 @@ def cmd_lanes(args):
     converged = set(os.path.basename(p) for p in all_projects if _is_converged_project(p))
     active = [os.path.basename(p) for p in all_projects if os.path.basename(p) not in converged]
     # index LIVE researchers by project
+    # claim -> project index (used as a fallback when a researcher was registered without project_id and
+    # its id carries no PROJ-NNNN — BUG-69: resolve via its current_exp_id's claim, else current_claim_id).
+    claim_to_proj = {}
+    for fn in glob.glob(reg_dir(root,"claims","**","CLAIM-*.yaml"),recursive=True):
+        cc = load_yaml(fn, {}) or {}
+        if cc.get("claim_id"): claim_to_proj[cc["claim_id"]] = cc.get("project_id","")
+    def _exp_proj(eid):
+        if not eid: return ""
+        for ef in glob.glob(os.path.join(root,"experiments","**",f"{eid}","experiment.yaml"),recursive=True):
+            ex = load_yaml(ef, {}) or {}
+            return claim_to_proj.get(ex.get("claim_id",""), ex.get("project_id",""))
+        return ""
     researchers_by_proj = {}
     for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
         a = load_yaml(fn, {}) or {}
         aid = a.get("agent_id", ""); role = a.get("role", "")
         if not (role == "researcher" or "researcher" in aid): continue
-        pid = a.get("project_id", "") or _infer_proj_from_id(aid)
+        pid = (a.get("project_id", "") or _infer_proj_from_id(aid)
+               or _exp_proj(a.get("current_exp_id","")) or claim_to_proj.get(a.get("current_claim_id",""), ""))
         try:
             last = _dt.datetime.strptime(a.get("last_heartbeat",""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
             age = (now - last).total_seconds()/60.0
