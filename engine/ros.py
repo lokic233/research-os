@@ -1981,12 +1981,23 @@ def cmd_progress(args):
     now = _dt.datetime.now(_dt.timezone.utc)
     TERMINAL_LS = ("done",)
 
-    # index pending committee-queue submissions (claim already forwarded) so we don't double-flag
-    pending_q = set()
+    # index pending committee-queue submissions (claim already forwarded) so we don't double-flag.
+    # Also track the OLDEST pending submit time per claim (BUG-68: a claim forwarded to the committee
+    # queue but never convened -> the orchestrator went idle -> nothing else flags it).
+    pending_q = set(); pending_q_age = {}
     try:
         if Channel is not None:
             for it in _committee_channel(root).list(include_acked=False):
-                if it.get("claim_id"): pending_q.add(it["claim_id"])
+                cid = it.get("claim_id")
+                if not cid: continue
+                pending_q.add(cid)
+                try:
+                    st = _dt.datetime.strptime(it.get("submitted_at",""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+                    age = (now - st).total_seconds()/60.0
+                except Exception:
+                    age = 0.0
+                if cid not in pending_q_age or age > pending_q_age[cid]:
+                    pending_q_age[cid] = age
     except Exception:
         pass
 
@@ -2086,6 +2097,16 @@ def cmd_progress(args):
                 faulttag = " (FAULT)" if gr.get("fault") else ""
                 stalls.append((cid, pid, "gpu-result-not-resubmitted", gr["age"], gpu_stall_min,
                                f"{exp} result {gr['id']} unacked{faulttag}"))
+
+        # (d) committee-queued-not-convened (BUG-68): claim forwarded to the committee queue but no committee
+        #     run started for it (orchestrator went idle) and it's been pending > stall_min -> work not landing.
+        qage = pending_q_age.get(cid)
+        if qage is not None and qage > stall_min and cid not in committee_done:
+            convening = any(re.search(rf"{re.escape(cid)}\b", os.path.basename(sd))
+                            for sd in glob.glob(os.path.join(rd, "committee_run_*")) if os.path.isdir(sd))
+            if not convening:
+                stalls.append((cid, pid, "committee-queued-not-convened", qage, stall_min,
+                               "in committee queue, no committee convened (orchestrator idle?)"))
 
     print(f"PROGRESS — time-since-last-real-landing across {inflight} in-flight claim(s) "
           f"(stall>{stall_min:g}m, GPU>{gpu_stall_min:g}m):")
