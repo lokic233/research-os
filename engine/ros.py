@@ -862,6 +862,95 @@ def _retire_pct(cfg):
     sm = ((cfg.get("research") or {}).get("sub_monitor") or {}).get("retire_at_context_pct")
     return int(sm) if sm is not None else 35
 
+def cmd_lanes(args):
+    """★ ANTI-SPRAWL (DESIGN_anti-sprawl_single-poller.md): emit the per-lane work plan for the SINGLE
+    multi-lane POLLER that REPLACES N self-spawning sub-monitor sessions. READ-ONLY (computes a plan, does
+    NOT spawn/mutate). For every ACTIVE (non-converged) project, reports the lane state + the ONE next
+    action keyword the poller should act on:
+      HOLD    = below floor, no open work -> NO-OP (correct; not a coverage gap; no make-work, no commit).
+      AWAIT   = a researcher is running OR committee is pending -> just heartbeat this cycle.
+      FORWARD = a researcher finished candidate-grade evidence (claim evidence_ready + no pending queue
+                item) -> poller should `ros queue submit` it (observe+forward only; never judge).
+      RESEED? = no live researcher AND the claim has open work (not terminal/not green) -> flag for the
+                ORCHESTRATOR (the lane NEVER auto-respawns; orchestrator owns reseed via reaper notifs).
+    Exit non-zero if any lane is FORWARD or RESEED? (so the poller wrapper can branch). One poller heartbeat
+    replaces N sub-monitor heartbeats; idle (HOLD/AWAIT) lanes do nothing -> kills the commit-churn idleness."""
+    import datetime as _dt
+    root = inst_root(args); rd = runtime_dir(root); cfg = _cfg(root)
+    liv = cfg.get("liveness", {}) or {}
+    grace = int(liv.get("patient_grace_minutes", 45))
+    now = _dt.datetime.now(_dt.timezone.utc)
+    all_projects = sorted(glob.glob(os.path.join(root, "projects", "PROJ-*")))
+    converged = set(os.path.basename(p) for p in all_projects if _is_converged_project(p))
+    active = [os.path.basename(p) for p in all_projects if os.path.basename(p) not in converged]
+    # index LIVE researchers by project
+    researchers_by_proj = {}
+    for fn in glob.glob(os.path.join(rd, "agents", "*.yaml")):
+        a = load_yaml(fn, {}) or {}
+        aid = a.get("agent_id", ""); role = a.get("role", "")
+        if not (role == "researcher" or "researcher" in aid): continue
+        pid = a.get("project_id", "") or _infer_proj_from_id(aid)
+        try:
+            last = _dt.datetime.strptime(a.get("last_heartbeat",""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+            age = (now - last).total_seconds()/60.0
+        except Exception:
+            age = 1e9
+        st = a.get("status","?")
+        alive = st not in ("completed","retired","failed","dead","superseded","done","dropped") and age <= grace
+        cur = researchers_by_proj.setdefault(pid, {"alive": [], "any": []})
+        cur["any"].append((aid, st, round(age,1)))
+        if alive: cur["alive"].append((aid, st, round(age,1)))
+    # pending committee-queue submissions by claim
+    pending_claims = set()
+    try:
+        if Channel is not None:
+            for it in _committee_channel(root).list(include_acked=False):
+                if it.get("claim_id"): pending_claims.add(it["claim_id"])
+    except Exception:
+        pass
+    # in-flight claims by project (lifecycle from registry)
+    claims_by_proj = {}
+    for fn in glob.glob(reg_dir(root,"claims","**","CLAIM-*.yaml"),recursive=True):
+        c = load_yaml(fn, {}) or {}
+        claims_by_proj.setdefault(c.get("project_id",""), []).append(c)
+    actionable = []
+    print(f"LANES — single-poller work plan ({len(active)} active project lane(s)"
+          + (f"; {len(converged)} converged (no lane): {', '.join(sorted(converged))}" if converged else "") + "):")
+    TERMINAL_LS = ("done",)
+    for pid in active:
+        cs = claims_by_proj.get(pid, [])
+        live = researchers_by_proj.get(pid, {}).get("alive", [])
+        # the lane's "open work" = any non-terminal, non-green in-flight claim
+        open_claims = [c for c in cs if c.get("lifecycle_state") not in TERMINAL_LS and c.get("status") != "green"]
+        evidence_ready = [c for c in cs if c.get("lifecycle_state") == "evidence_ready"
+                          and c.get("claim_id") not in pending_claims]
+        if evidence_ready:
+            action = "FORWARD"
+            detail = f"evidence_ready (not yet queued): {', '.join(c.get('claim_id','?') for c in evidence_ready)}"
+        elif live:
+            action = "AWAIT"
+            detail = f"researcher(s) live: {', '.join(a for a,_,_ in live)}"
+        elif any(c.get('claim_id') in pending_claims for c in cs):
+            action = "AWAIT"
+            detail = "committee submission pending in queue"
+        elif open_claims:
+            action = "RESEED?"
+            detail = ("no live researcher + open work: "
+                      + ', '.join(f"{c.get('claim_id','?')}[{c.get('lifecycle_state','?')}]" for c in open_claims)
+                      + " — ORCHESTRATOR decides reseed (lane does NOT auto-respawn)")
+        else:
+            action = "HOLD"
+            detail = "below floor, no open work (correct; not a gap)"
+        mark = {"FORWARD":"📤","AWAIT":"⏳","RESEED?":"⚠️","HOLD":"·"}[action]
+        print(f"  {mark} {pid}: {action} — {detail}")
+        if action in ("FORWARD","RESEED?"): actionable.append((pid, action, detail))
+    if actionable:
+        print(f"\n{len(actionable)} actionable lane(s) for the poller:")
+        for pid, act, det in actionable: print(f"   - {pid}: {act}")
+        sys.exit(3)
+    print("\n✅ all lanes HOLD/AWAIT — poller heartbeats, no action, no commit (idle is healthy).")
+
+
 def cmd_coordinators(args):
     """GPU-COORDINATOR DISCOVERY + health (ORCHESTRATOR duty). Mirror of `ros submonitors` but for the
     role==gpu_coordinator one-per-GPU-backend invariant: enumerate every config compute_node with kind==gpu
@@ -1844,6 +1933,7 @@ def main():
     hb.set_defaults(fn=cmd_heartbeat)
     sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
     sub.add_parser("submonitors").set_defaults(fn=cmd_submonitors)
+    sub.add_parser("lanes", help="ANTI-SPRAWL single-poller per-lane work plan (FORWARD|AWAIT|RESEED?|HOLD); read-only").set_defaults(fn=cmd_lanes)
     sub.add_parser("coordinators").set_defaults(fn=cmd_coordinators)
     cm = sub.add_parser("commit")
     cm.add_argument("--message", "-m", help="commit message (default: ros commit autosave <ts>)")
