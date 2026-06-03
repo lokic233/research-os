@@ -1210,7 +1210,14 @@ def cmd_exp_gc(args):
                     # AttributeError. Latent today (no _t.time() after the rebind), fixed defensively.
                     import supervise as _sup; _H=_sup_helpers()
                     for _tk in _sup.task_list(_H, root):
-                        if _tk.get("assignee")==_owner and _tk.get("status") in ("open","active"):
+                        # ★ BUG-92: scope the close to the task tied to THIS retired orphan exp (exp_id==eid).
+                        # The old loop closed EVERY open/active task of the owner — but unlike the BUG-60b
+                        # exp-complete path (guarded by `not other_open`, i.e. researcher fully done), gc
+                        # retires ONE stale orphan and the owner may still be alive with other live tasks
+                        # on other experiments. Closing those wrongly drops live work. Only close the
+                        # orphan's own task (exp_id match); unscoped (exp_id=="") tasks left untouched.
+                        if (_tk.get("assignee")==_owner and _tk.get("status") in ("open","active")
+                                and _tk.get("exp_id")==eid):
                             _sup.task_update(_H, root, _tk["task_id"], status="done", by="exp-gc",
                                              note=f"orphan EXP {eid} retired by gc (assignee {_owner} never completed)",
                                              _internal=True)
