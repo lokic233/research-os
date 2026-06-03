@@ -1177,9 +1177,13 @@ def cmd_exp_gc(args):
         e=load_yaml(ef,{}) or {}
         if e.get("status")!="pending" or e.get("result_effect"): continue
         d=os.path.dirname(ef)
-        # BUG-24 SAFETY: never retire a pending exp that has ANY artifacts (active researcher mid-run)
-        arts=[p for p in glob.glob(os.path.join(d,"**","*"),recursive=True)
-              if os.path.isfile(p) and os.path.basename(p)!="experiment.yaml"]
+        # BUG-24 SAFETY: never retire a pending exp that has ANY artifacts (active researcher mid-run).
+        # BUG-95: glob("**/*") SKIPS dotfiles, but committee packet staging writes ONLY dotfile markers
+        # first (.members.txt, .v3_notified.ready, pre-reg .ready) before any regular file lands. A pending
+        # exp staged this way has NO regular artifacts -> the skip wouldn't fire -> a stale-mtime mid-staging
+        # exp would be WRONGLY gc-retired (back-link cleared, task closed). os.walk sees dotfiles too; use it
+        # so the BUG-24 "ANY artifacts" guarantee actually holds. Fails SAFE: any file present -> skip.
+        arts=[os.path.join(rt,fn) for rt,_,fns in os.walk(d) for fn in fns if fn!="experiment.yaml"]
         if arts: skipped.append((e.get("exp_id"),"has artifacts (active?)")); continue
         # never retire one modified within the stale window (recent = possibly mid-flight)
         age_min=(_t.time()-os.path.getmtime(ef))/60.0
@@ -1628,13 +1632,28 @@ def _infer_committee_dir(root, exp_paths):
     returned committee* of the FIRST cited experiment only — pointing committee_run_dir at the STALE
     pass-1 committee (whose votes differ, e.g. 5-yellow vs the recorded 6-red). That made an honest
     two-pass verdict look like vote-fabrication to a votes-vs-.out integrity auditor. The final pass is
-    always the most-recently-written committee dir, so pick the globally newest across all cited exps."""
+    always the most-recently-written committee dir, so pick the globally newest across all cited exps.
+
+    BUG-95 FIX: rank by the committee's VOTE CONTENT (newest *.out mtime), NOT the directory mtime.
+    A dir's mtime bumps on ANY child create/delete/rename — a trailing .err/.log flush, the
+    .v3_notified.ready marker write, or a log rotation can re-stamp the STALE pass-1 dir AFTER pass-2
+    finished, flipping the old getmtime(dir) sort back to the wrong (pass-1) committee — re-opening the
+    exact vote-mismatch BUG-81 closed. The recorded reviewer_votes are extracted from the *.out files, so
+    rank by the newest *.out (the votes themselves). Tiebreak: a committee that HAS *.out votes always
+    beats one that does not (an in-flight pass-2 dir with no votes yet must not shadow pass-1's real votes)."""
     cand = []
     for ep in (exp_paths or []):
         cand.extend(glob.glob(os.path.join(root, ep, "committee*")))
     cand = [c for c in cand if os.path.isdir(c)]
     if cand:
-        cand.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+        def _sig(p):
+            outs = glob.glob(os.path.join(p, "*.out"))
+            if outs:
+                try: return (1, max(os.path.getmtime(f) for f in outs))
+                except OSError: return (1, 0)
+            # no votes yet (in-flight): rank below any committee that has votes; dir mtime as weak fallback
+            return (0, os.path.getmtime(p) if os.path.exists(p) else 0)
+        cand.sort(key=_sig)
         return os.path.relpath(cand[-1], root)
     return ""
 
