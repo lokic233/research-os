@@ -188,6 +188,15 @@ def reap(H, root, *, apply=False, grace_min=45, converged_pids=None):
                     if new_status == "superseded" and succ:
                         task_update(H, root, t["task_id"], assignee=succ.get("agent_id"), by="reaper",
                                     note=f"reassigned from superseded {a.get('agent_id')} -> {succ.get('agent_id')}")
+                    elif new_status == "retired":
+                        # BUG-96: a CLEAN retire (converged project / no project, "no successor needed",
+                        # deliberately NO AGENT_DOWN) must NOT orphan its leftover open tasks + emit a
+                        # spurious actionable TASK_ORPHANED — there is no work to respawn/reseed on a
+                        # converged project (same principle as BUG-28: converged projects generate no
+                        # supervision signal). Drop the leftover task cleanly instead. Only DEAD (real
+                        # coverage gap on an ACTIVE project) orphans + notifies.
+                        task_update(H, root, t["task_id"], status="dropped", by="reaper",
+                                    note=f"assignee {a.get('agent_id')} retired (converged/no project — no work to reassign)")
                     else:
                         task_update(H, root, t["task_id"], status="orphaned", by="reaper",
                                     note=f"assignee {a.get('agent_id')} {new_status}")
