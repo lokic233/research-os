@@ -179,15 +179,46 @@ def reap(H, root, *, apply=False, grace_min=45, converged_pids=None):
         else:
             new_status = "dead"                         # ACTIVE project, no live successor -> real coverage gap
             note = f"DEAD (age {round(a['_age'])}m, no live successor for ACTIVE {pid})"
+        if apply:
+            # ★ BUG-113: this agent-status RMW was UNLOCKED while cmd_heartbeat (BUG-99) serializes the
+            # SAME agent record under _file_lock(root,f"agent_<id>"). A reaper that read a stale-running
+            # agent then dumped status=retired/dead/superseded could clobber a concurrent LOCKED heartbeat
+            # that JUST proved the agent ALIVE -> lost heartbeat / wrongful reap of a live agent (+ spurious
+            # AGENT_DOWN or wiped retired_to). Same locked-writer-vs-unlocked-racer class as BUG-109/110/112.
+            # Fix (no new mechanism): hold the SAME per-agent _file_lock across RE-READ -> status-flip -> dump,
+            # and RE-CHECK liveness inside the lock so a heartbeat that landed since the snapshot DEFERS the
+            # reap (the agent is no longer past-grace). Unlocked fallback only if _file_lock unavailable
+            # (mirror BUG-99/110). On defer, drop the planned change so we don't report a phantom reap.
+            _aid = a.get("agent_id")
+            _fl = H.get("_file_lock")
+            def _apply_flip():
+                a2 = H["load_yaml"](a["_fn"], {}) or {}
+                # RE-CHECK inside the lock: if the record is already terminal, or a fresh heartbeat
+                # pulled it back within grace, the reap no longer applies -> defer (return None).
+                if a2.get("status") not in ALIVE_STATES:
+                    return None
+                if _age_min(a2, now) <= grace_min:
+                    return None
+                a2["status"] = new_status
+                a2["reaped_at"] = H["NOW"]()
+                a2["reaped_note"] = note
+                if new_status == "superseded" and succ:
+                    a2["retired_to"] = succ.get("agent_id")
+                H["dump_yaml"](a["_fn"], a2)
+                return True
+            if _fl is not None:
+                try:
+                    with _fl(root, f"agent_{_aid}", stale_s=15):
+                        _flipped = _apply_flip()
+                except Exception:
+                    _flipped = _apply_flip()
+            else:
+                _flipped = _apply_flip()
+            if not _flipped:
+                # a heartbeat raced us back to life (or it's already terminal) — do NOT record/notify a reap
+                continue
         changes.append((a.get("agent_id"), a.get("status"), new_status, pid, a.get("role", ""), note))
         if apply:
-            a2 = H["load_yaml"](a["_fn"], {}) or {}
-            a2["status"] = new_status
-            a2["reaped_at"] = H["NOW"]()
-            a2["reaped_note"] = note
-            if new_status == "superseded" and succ:
-                a2["retired_to"] = succ.get("agent_id")
-            H["dump_yaml"](a["_fn"], a2)
             # BUG-49 fix: if superseded, re-parent this agent's LIVE children to the live successor so
             # the supervision tree doesn't fragment (a live researcher must hang off its live supervisor).
             if new_status == "superseded" and succ:
