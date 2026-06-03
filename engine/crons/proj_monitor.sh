@@ -11,7 +11,7 @@ lanes_out="$(ROS lanes 2>&1)"; lanes_rc=$?
 # de-dup directory: one marker per (lane,action) so a lane stuck in RESEED?/ADVANCE? notifies ONCE, not
 # every 5-min cycle (avoids orchestrator-inbox churn). Markers for lanes no longer in that state are cleared.
 NDIR="$CRON_DIR/.proj_notified"; mkdir -p "$NDIR"
-echo "$lanes_out" | grep -E '📤|⚠️|🔬' | while IFS= read -r line; do
+echo "$lanes_out" | grep -E '📤|⚠️|🔬|🌱' | while IFS= read -r line; do
   pid="$(echo "$line" | grep -oE 'PROJ-[0-9]+' | head -1)"
   case "$line" in
     *FORWARD*)
@@ -31,22 +31,30 @@ echo "$lanes_out" | grep -E '📤|⚠️|🔬' | while IFS= read -r line; do
           --detail "$(echo "$line" | sed 's/^[[:space:]]*//')" --by proj-monitor --role proj_monitor >/dev/null \
           && touch "$NDIR/$pid.reseed"; log "RESEED? $pid -> orchestrator"
       fi
-      rm -f "$NDIR/$pid.advance" ;;
+      rm -f "$NDIR/$pid.advance" "$NDIR/$pid.seed" ;;
     *ADVANCE?*)
       if [ ! -f "$NDIR/$pid.advance" ]; then
         ROS notify --to orchestrator --event ADVANCE --subject "$pid" \
           --detail "$(echo "$line" | sed 's/^[[:space:]]*//')" --by proj-monitor --role proj_monitor >/dev/null \
           && touch "$NDIR/$pid.advance"; log "ADVANCE? $pid -> orchestrator"
       fi
-      rm -f "$NDIR/$pid.reseed" ;;
+      rm -f "$NDIR/$pid.reseed" "$NDIR/$pid.seed" ;;
+    *SEED?*)
+      # BUG-73: frontier exhausted (all claims terminal) -> orchestrator designs a new claim OR converges.
+      if [ ! -f "$NDIR/$pid.seed" ]; then
+        ROS notify --to orchestrator --event SEED --subject "$pid" \
+          --detail "$(echo "$line" | sed 's/^[[:space:]]*//')" --by proj-monitor --role proj_monitor >/dev/null \
+          && touch "$NDIR/$pid.seed"; log "SEED? $pid -> orchestrator"
+      fi
+      rm -f "$NDIR/$pid.reseed" "$NDIR/$pid.advance" ;;
   esac
 done
-# clear stale sentinels for lanes that are no longer RESEED?/ADVANCE? (state changed -> allow re-notify later)
-for mk in "$NDIR"/*.reseed "$NDIR"/*.advance; do
+# clear stale sentinels for lanes that are no longer RESEED?/ADVANCE?/SEED? (state changed -> allow re-notify later)
+for mk in "$NDIR"/*.reseed "$NDIR"/*.advance "$NDIR"/*.seed; do
   [ -e "$mk" ] || continue
-  p="$(basename "$mk" | sed -E 's/\.(reseed|advance)$//')"
-  act="$(echo "$mk" | grep -oE '(reseed|advance)$')"
-  kw="RESEED?"; [ "$act" = "advance" ] && kw="ADVANCE?"
+  p="$(basename "$mk" | sed -E 's/\.(reseed|advance|seed)$//')"
+  act="$(echo "$mk" | grep -oE '(reseed|advance|seed)$')"
+  case "$act" in reseed) kw="RESEED?";; advance) kw="ADVANCE?";; seed) kw="SEED?";; esac
   echo "$lanes_out" | grep -E "$p:" | grep -qF "$kw" || rm -f "$mk"
 done
 # lanes exit 3 = actionable (handled above), exit 0 = all HOLD/AWAIT (silent healthy). Both are success.

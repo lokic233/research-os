@@ -1008,11 +1008,22 @@ def cmd_lanes(args):
                       + ', '.join(f"{c.get('claim_id','?')}[{(c.get('verdict_history') or [{}])[-1].get('result','?')}]" for c in verdict_open)
                       + " — dispatch TARGETED follow-up for required_evidence OR accept/converge (NOT a blind reseed)")
         else:
-            action = "HOLD"
-            detail = "below floor, no open work (correct; not a gap)"
-        mark = {"FORWARD":"📤","AWAIT":"⏳","RESEED?":"⚠️","ADVANCE?":"🔬","HOLD":"·"}[action]
+            # ★ BUG-73: distinguish "genuinely below floor, no claims yet" (silent HOLD) from "all claims
+            # EXHAUSTED (every claim terminal) — the frontier is mined out, design a NEW claim". The latter
+            # was silently HOLDing while the project still counted as 'investing' -> orchestrator idled
+            # at target without seeding new science. A project with >=1 claim, all terminal, no live
+            # researcher, nothing pending -> SEED? (actionable: orchestrator designs a new claim OR marks
+            # the project converged to free the slot).
+            if cs and all(c.get("lifecycle_state") in TERMINAL_LS or c.get("status") in ("green","promoted") for c in cs):
+                action = "SEED?"
+                detail = (f"all {len(cs)} claim(s) terminal (frontier exhausted) — ORCHESTRATOR: design a NEW "
+                          "claim here, OR mark the project converged (.converged) to free the slot")
+            else:
+                action = "HOLD"
+                detail = "below floor, no open work (correct; not a gap)"
+        mark = {"FORWARD":"📤","AWAIT":"⏳","RESEED?":"⚠️","ADVANCE?":"🔬","SEED?":"🌱","HOLD":"·"}[action]
         print(f"  {mark} {pid}: {action} — {detail}")
-        if action in ("FORWARD","RESEED?","ADVANCE?"): actionable.append((pid, action, detail))
+        if action in ("FORWARD","RESEED?","ADVANCE?","SEED?"): actionable.append((pid, action, detail))
     if actionable:
         print(f"\n{len(actionable)} actionable lane(s) for the poller:")
         for pid, act, det in actionable: print(f"   - {pid}: {act}")
