@@ -2079,7 +2079,16 @@ def cmd_progress(args):
         except Exception:
             age = 0.0
         cidx = ex.get("claim_id","")
-        rec = {"age": age, "exp": ex.get("exp_id"), "lease": ex.get("node_lease")}
+        # BUG-72: a GPU run is only "stuck" once it exceeds its OWN wall-clock budget + grace — NOT a flat
+        # gpu_stall_min (30m). A legitimately long L1/L2/L3 exp (e.g. 120m budget) ran ~50m and falsely
+        # tripped WORK_NOT_LANDING. Threshold = max(gpu_stall_min, exp's max_wall_clock_minutes + gpu_stall_min grace).
+        budget_min = 0
+        try:
+            budget_min = int((ex.get("resource_budget") or {}).get("max_wall_clock_minutes", 0) or 0)
+        except (TypeError, ValueError):
+            budget_min = 0
+        thr = max(gpu_stall_min, budget_min + gpu_stall_min) if budget_min else gpu_stall_min
+        rec = {"age": age, "exp": ex.get("exp_id"), "lease": ex.get("node_lease"), "thr": thr}
         if cidx not in gpu_running_by_claim or age > gpu_running_by_claim[cidx]["age"]:
             gpu_running_by_claim[cidx] = rec
 
@@ -2176,9 +2185,9 @@ def cmd_progress(args):
         #     with NO result landed -> the run hung/died, node stuck leased -> notify orchestrator to
         #     fault+release (ros exp dispatch --fault auto-releases) and re-dispatch.
         gr_run = gpu_running_by_claim.get(cid)
-        if gr_run and gr_run["age"] > gpu_stall_min:
-            stalls.append((cid, pid, "gpu-run-no-result", gr_run["age"], gpu_stall_min,
-                           f"{gr_run['exp']} running+leased {gr_run['lease']}, no result — fault+release+re-dispatch"))
+        if gr_run and gr_run["age"] > gr_run["thr"]:
+            stalls.append((cid, pid, "gpu-run-no-result", gr_run["age"], gr_run["thr"],
+                           f"{gr_run['exp']} running+leased {gr_run['lease']}, no result (>budget+grace) — fault+release+re-dispatch"))
 
     print(f"PROGRESS — time-since-last-real-landing across {inflight} in-flight claim(s) "
           f"(stall>{stall_min:g}m, GPU>{gpu_stall_min:g}m):")
