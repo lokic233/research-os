@@ -181,9 +181,17 @@ def reap(H, root, *, apply=False, grace_min=45, converged_pids=None):
             # orphan this agent's open tasks (+ re-parent tasks parented by a superseded agent)
             for t in task_list(H, root):
                 if t.get("assignee") == a.get("agent_id") and t.get("status") in ("open", "active"):
-                    task_update(H, root, t["task_id"], status="orphaned", by="reaper",
-                                note=f"assignee {a.get('agent_id')} {new_status}")
-                    notifs.append(("TASK_ORPHANED", t["task_id"], t.get("project_id", "")))
+                    # BUG-88 fix: a SUPERSEDED agent has a live same-(project,role) successor that IS its
+                    # continuation — transfer its assigned open/active work to that successor (mirrors
+                    # handoff() frm->to) instead of orphaning it + emitting a spurious TASK_ORPHANED for
+                    # work that already has a live owner. Only DEAD/retired-without-successor agents orphan.
+                    if new_status == "superseded" and succ:
+                        task_update(H, root, t["task_id"], assignee=succ.get("agent_id"), by="reaper",
+                                    note=f"reassigned from superseded {a.get('agent_id')} -> {succ.get('agent_id')}")
+                    else:
+                        task_update(H, root, t["task_id"], status="orphaned", by="reaper",
+                                    note=f"assignee {a.get('agent_id')} {new_status}")
+                        notifs.append(("TASK_ORPHANED", t["task_id"], t.get("project_id", "")))
                 elif (new_status == "superseded" and succ and t.get("parent") == a.get("agent_id")
                       and t.get("status") not in ("done", "dropped")):
                     p = _task_path(H, root, t["task_id"]); r = H["load_yaml"](p, {}) or {}
