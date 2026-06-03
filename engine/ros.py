@@ -535,7 +535,8 @@ def cmd_heartbeat(args):
     elif not rec.get("role"): rec["role"] = "unknown"
     rec["last_heartbeat"] = NOW()
     rec["heartbeat_count"] = int(rec.get("heartbeat_count", 0)) + 1
-    # ★ BUG-97 FIX: a lagging/duplicate heartbeat from an agent that has ALREADY retired (or otherwise
+    # ★ BUG-98 FIX (relabeled from BUG-97 — co-staged with the inbox-ack fix; see 15c4538): a
+    # lagging/duplicate heartbeat from an agent that has ALREADY retired (or otherwise
     # reached a terminal state) must NOT resurrect it to a live status. A retired orchestrator/sub-monitor
     # that emits one final late `--status running` (in-flight when its successor took over) would otherwise
     # flip status back to 'running' while retired_at/retired_to still point at a LIVE successor — instant
