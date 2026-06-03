@@ -1195,6 +1195,23 @@ def cmd_exp_gc(args):
             # mark the experiment retired (keep the dir for audit; don't delete)
             ef=os.path.join(d,"experiment.yaml"); e=load_yaml(ef); e["status"]="retired"
             e["result_summary"]="retired by ros exp gc (orphan pending, never completed)"; dump_yaml(ef,e)
+            # ★ BUG-86: close the owning researcher's OPEN tasks for this retired orphan exp. Symmetric with
+            # the exp-complete path (BUG-60b): without this, a GC-retired orphan (researcher died, exp never
+            # completed) leaves its task ledger entry open/active FOREVER -> orphan-task accumulation. The
+            # reaper only orphans tasks of agents it flags DEAD; a clean gc of a stale exp bypasses that.
+            # Best-effort + non-fatal (mirror BUG-60b).
+            _owner = e.get("ran_by") or e.get("dispatched_by") or ""
+            if _owner:
+                try:
+                    import supervise as _sup; _H=_sup_helpers()
+                    for _t in _sup.task_list(_H, root):
+                        if _t.get("assignee")==_owner and _t.get("status") in ("open","active"):
+                            _sup.task_update(_H, root, _t["task_id"], status="done", by="exp-gc",
+                                             note=f"orphan EXP {eid} retired by gc (assignee {_owner} never completed)",
+                                             _internal=True)
+                            print(f"   closed orphan task {_t['task_id']} (assignee {_owner}, exp gc-retired)")
+                except Exception:
+                    pass
     if not args.apply: print("   (dry-run; re-run with --apply to retire)")
     else: print("   retired + cleared back-links")
 
