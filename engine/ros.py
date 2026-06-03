@@ -1053,6 +1053,18 @@ def cmd_lanes(args):
         print(f"\n{len(actionable)} actionable lane(s) for the poller:")
         for pid, act, det in actionable: print(f"   - {pid}: {act}")
         sys.exit(3)
+    # ★ BUG-81: when no per-lane work AND the investing count is below target (e.g. all projects converged
+    # into yellow/red dead-ends), the refill-to-target directive lived ONLY in `ros projects` (which no cron
+    # polls) — so the orchestrator saw "idle is healthy" and sat idle below target, never designing new
+    # projects. Emit an actionable DESIGN? signal here so proj_monitor notifies the orchestrator to refill.
+    invest_target = _concurrent_invest_target(cfg)
+    n_investing = len(active)
+    if n_investing < invest_target:
+        deficit = invest_target - n_investing
+        print(f"\n🌱 DESIGN? — {n_investing}/{invest_target} investing (below target by {deficit}): "
+              f"ORCHESTRATOR must DESIGN {deficit} NEW project(s) (novel, cemetery-checked, topic-bias) "
+              f"and seed each. Converged: {', '.join(sorted(converged)) or '(none)'}.")
+        sys.exit(3)
     print("\n✅ all lanes HOLD/AWAIT — poller heartbeats, no action, no commit (idle is healthy).")
 
 
@@ -1509,13 +1521,22 @@ def cmd_gpu_result_ack(args):
 def _infer_committee_dir(root, exp_paths):
     """BUG-80: derive a verdict's committee_run_dir from its cited experiment(s) when the caller did not
     pass --committee-dir. The committee evidence lives under <exp_path>/committee* (e.g. committee1,
-    committee2). Returns the newest such dir (relative to root) for the first cited experiment, or "" if
-    none exists yet. Pure read; never creates anything. Closes the v2-parity traceability gap."""
+    committee2). Returns the GLOBALLY-newest such dir (relative to root) across ALL cited experiments,
+    or "" if none exists yet. Pure read; never creates anything. Closes the v2-parity traceability gap.
+
+    BUG-81 FIX: a two-pass verdict cites [L0_exp, L1_exp] (e.g. EXP-0020, EXP-0022). The recorded
+    reviewer_votes come from the FINAL (pass-2) committee under the L1 experiment, but the OLD code
+    returned committee* of the FIRST cited experiment only — pointing committee_run_dir at the STALE
+    pass-1 committee (whose votes differ, e.g. 5-yellow vs the recorded 6-red). That made an honest
+    two-pass verdict look like vote-fabrication to a votes-vs-.out integrity auditor. The final pass is
+    always the most-recently-written committee dir, so pick the globally newest across all cited exps."""
+    cand = []
     for ep in (exp_paths or []):
-        cand = sorted(glob.glob(os.path.join(root, ep, "committee*")),
-                      key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
-        if cand:
-            return os.path.relpath(cand[-1], root)
+        cand.extend(glob.glob(os.path.join(root, ep, "committee*")))
+    cand = [c for c in cand if os.path.isdir(c)]
+    if cand:
+        cand.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+        return os.path.relpath(cand[-1], root)
     return ""
 
 def cmd_verdict_write(args):
