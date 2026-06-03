@@ -2921,17 +2921,27 @@ def cmd_seeder_next(args):
         if age<=grace: live.append(a.get("agent_id"))
     converged = _is_converged_project(os.path.join(root,"projects",pid))
     nclaims=len(cs); nverd=sum(1 for c in cs if c.get("lifecycle_state") in TERMINAL_LS or c.get("verdict_history"))
+    max_claims = int((cfg.get("globals", {}) or {}).get("max_claims_per_project",
+                     (cfg.get("research", {}) or {}).get("max_claims_per_project", 999)))
     print(f"SEEDER-NEXT {pid}: {nclaims} claim(s), {len(inflight)} in-flight, {len(live)} live researcher(s), "
-          f"per_project={per_proj}, converged={converged}")
+          f"per_project={per_proj}, max_claims/proj={max_claims}, converged={converged}")
     if converged:
         print("  ✅ CONVERGE — project already marked converged; no new claim. Free the slot."); return
     if inflight:
         print(f"  ⏳ AWAIT — in-flight claim(s): {', '.join(c.get('claim_id','?') for c in inflight)} "
               f"— let them land (committee/exp/verdict) before seeding a new claim."); return
-    # no in-flight work. is there a free seeder slot?
+    # ★ BUG-116: LIGHTWEIGHT posture — if the project has already used its claim budget (total claims >=
+    # max_claims_per_project), do NOT seed another claim in the SAME project. CONVERGE it (mine-out) and let
+    # the orchestrator open a FRESH project instead (per DECISION_expand_lightweight: converge-on-death,
+    # breadth>depth). max_claims_per_project defaults large (deep-mine) when the knob is absent.
+    if nclaims >= max_claims:
+        print(f"  ✅ CONVERGE — project hit its claim budget ({nclaims}/{max_claims} claims, all adjudicated). "
+              f"LIGHTWEIGHT: do NOT seed another claim here — `touch projects/{pid}/.converged` and move to a "
+              f"FRESH topic-bias area (orchestrator opens a new project to refill the investing target)."); return
+    # no in-flight work + under claim budget. is there a free seeder slot?
     if len(live) >= per_proj:
         print(f"  ⏳ AWAIT — {len(live)} live researcher(s) already at per_project={per_proj}; no free slot."); return
-    print(f"  🌱 SEED-NEXT — frontier open ({nclaims} claim(s) all adjudicated, slot free): DESIGN a NEW "
+    print(f"  🌱 SEED-NEXT — frontier open ({nclaims}/{max_claims} claim(s), slot free): DESIGN a NEW "
           f"cemetery-checked claim under {pid} (or `touch projects/{pid}/.converged` if the topic is mined out). "
           f"Do NOT sit idle.")
     sys.exit(3)
