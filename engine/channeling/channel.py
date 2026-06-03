@@ -123,14 +123,19 @@ class Channel:
         if predicate: out = [i for i in out if predicate(i)]
         return out
 
-    def ack(self, item_id=None, all_items=False, by="", answer="", mirror_key=None):
+    def ack(self, item_id=None, all_items=False, by="", answer="", mirror_key=None,
+            match_field=None, match_val=None):
         # ★ BUG-59: ack is also read-modify-write -> serialize it (a concurrent submit during ack could
         # otherwise lose either the ack or the new item). mirror_key matches legacy items whose id lives
         # under an alias key (e.g. 'queue_id') with no native 'id'.
+        # ★ BUG-97: (match_field, match_val) acks ALL un-acked items where item[match_field]==match_val
+        # (e.g. per-agent inbox ack) — INSIDE the lock, so a concurrent submit can't be clobbered by an
+        # unlocked read-modify-write (the inbox-ack analogue of the BUG-59 queue-ack fix).
         with _FileLock(self.path):
             d = self._read(); n = 0
             for i in d[self.list_key]:
                 if i.get("acked"): continue
-                if all_items or i.get("id") == item_id or (mirror_key and i.get(mirror_key) == item_id):
+                if (all_items or i.get("id") == item_id or (mirror_key and i.get(mirror_key) == item_id)
+                        or (match_field is not None and i.get(match_field) == match_val)):
                     i["acked"] = True; i["acked_at"] = NOW(); i["acked_by"] = by; i["answer"] = answer; n += 1
             _dump(self.path, d); return n

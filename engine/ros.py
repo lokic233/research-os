@@ -535,7 +535,18 @@ def cmd_heartbeat(args):
     elif not rec.get("role"): rec["role"] = "unknown"
     rec["last_heartbeat"] = NOW()
     rec["heartbeat_count"] = int(rec.get("heartbeat_count", 0)) + 1
-    if args.status: rec["status"] = args.status
+    # ★ BUG-97 FIX: a lagging/duplicate heartbeat from an agent that has ALREADY retired (or otherwise
+    # reached a terminal state) must NOT resurrect it to a live status. A retired orchestrator/sub-monitor
+    # that emits one final late `--status running` (in-flight when its successor took over) would otherwise
+    # flip status back to 'running' while retired_at/retired_to still point at a LIVE successor — instant
+    # split-brain (two running agents on the same session). Terminal states are absorbing: keep them.
+    _TERMINAL = ("retired", "completed", "failed", "superseded", "dropped")
+    if rec.get("status") in _TERMINAL:
+        if args.status and args.status not in _TERMINAL:
+            print(f"⚠️ {args.agent} is {rec['status']} (terminal) — ignoring late heartbeat's status='{args.status}' (no revive).")
+        # absorb the liveness bump but do NOT change a terminal status
+    elif args.status:
+        rec["status"] = args.status
     if args.note: rec["note"] = args.note
     if args.claim: rec["current_claim_id"] = args.claim
     if args.exp: rec["current_exp_id"] = args.exp
@@ -728,10 +739,16 @@ def cmd_inbox(args):
 def cmd_inbox_ack(args):
     root = inst_root(args); rd = runtime_dir(root)
     p = os.path.join(rd, "orchestrator", "inbox.yaml")
-    if Channel is not None and args.all:
-        n = Channel(p, list_key="items", id_prefix="IN").ack(all_items=True, answer=args.answer or "")
+    if Channel is not None:
+        ch = Channel(p, list_key="items", id_prefix="IN")
+        if args.all:
+            n = ch.ack(all_items=True, answer=args.answer or "")
+        else:
+            # ★ BUG-97: per-agent ack runs INSIDE the channel lock (match_field) — an unlocked
+            # read-modify-write here could clobber a concurrent inbox submit (BUG-59 analogue).
+            n = ch.ack(match_field="agent", match_val=args.agent, answer=args.answer or "")
     else:
-        # per-agent ack: Channel.ack keys on item id, not agent; keep the explicit loop for the agent filter.
+        # per-agent ack: keep the explicit loop for the no-Channel fallback.
         inbox = load_yaml(p, {"items": []}) or {"items": []}
         n = 0
         for i in inbox["items"]:
