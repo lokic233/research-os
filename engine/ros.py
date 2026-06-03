@@ -146,6 +146,31 @@ def next_id(root, kind, prefix):
             try: os.close(fd); os.unlink(lockpath)
             except OSError: pass
 
+import contextlib as _contextlib
+@_contextlib.contextmanager
+def _file_lock(root, name, stale_s=30, tries=600):
+    """BUG-84: minimal exclusive lock (same O_EXCL + stale-reclaim discipline as next_id / BUG-52).
+    Serializes a read-modify-write critical section on a shared runtime file (e.g. the gpu queue),
+    so concurrent callers cannot both pass a check-then-act and clobber each other."""
+    import time as _t
+    rd = runtime_dir(root); lockdir = os.path.join(rd, "locks"); os.makedirs(lockdir, exist_ok=True)
+    lockpath = os.path.join(lockdir, f"{name}.lock")
+    fd = None
+    for _ in range(tries):
+        try:
+            fd = os.open(lockpath, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644); break
+        except FileExistsError:
+            try:
+                if _t.time() - os.path.getmtime(lockpath) > stale_s: os.unlink(lockpath); continue
+            except OSError: pass
+            _t.sleep(0.05)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try: os.close(fd); os.unlink(lockpath)
+            except OSError: pass
+
 def _fingerprint(text):
     """Normalized keyword set for cemetery dup detection."""
     words = re.findall(r"[a-z0-9]+", (text or "").lower())
@@ -1674,6 +1699,23 @@ def cmd_verdict_write(args):
         claim["lifecycle_state"]="verdict_recorded"
         claim["next_action"]=f"{vid}={args.final}: address required_evidence to advance"
     claim["last_updated"]=NOW(); dump_yaml(cf,claim)
+    # ★ BUG-84: a committee KILL verdict set status=dead but NEVER buried the claim to the cemetery — only
+    # the `ros exp complete --effect kill` path did. So committee-killed ideas were absent from the DEAD-*
+    # dedup set, and `ros seed new` could RESURRECT them (violates Invariant 2: no cemetery idea resurrects).
+    # Bury here too, idempotently (skip if this claim already has a DEAD entry, e.g. exp-complete buried it).
+    if args.final=="kill":
+        already=any((load_yaml(df,{}) or {}).get("original_claim_id")==args.claim
+                    for df in glob.glob(reg_dir(root,"cemetery","**","DEAD-*.yaml"),recursive=True))
+        if not already:
+            did=next_id(root,"cemetery","DEAD")
+            ctext=claim.get("claim","") or claim.get("why_it_matters","")
+            dump_yaml(os.path.join(obj_dir(root,"cemetery",claim.get("project_id","PROJ-0001")), f"{did}.yaml"), {
+                "dead_id":did, "original_claim_id":args.claim, "original_claim":ctext,
+                "reason_killed":args.finding or args.disposition or f"committee KILL verdict {vid}",
+                "killing_verdict":vid, "killing_experiments":exp_ids,
+                "duplicate_patterns":[ctext, " ".join(sorted(_fingerprint(ctext)))],
+                "revival_conditions":(args.required or ""), "related_prior_work":[], "date_killed":NOW()})
+            print(f"   buried as {did} (committee KILL -> cemetery, dedup guard)")
     for eid in exp_ids:
         ep=glob.glob(os.path.join(root,"experiments","**",eid,"experiment.yaml"),recursive=True)[0]
         e=load_yaml(ep); e.setdefault("linked_verdicts",[]).append(vid); dump_yaml(ep,e)
