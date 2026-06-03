@@ -1506,6 +1506,18 @@ def cmd_gpu_result_ack(args):
                                       by=args.by or "", answer=args.answer or "")
     print(f"✅ acked {n} gpu-result(s)" + (f": {args.answer}" if args.answer else ""))
 
+def _infer_committee_dir(root, exp_paths):
+    """BUG-80: derive a verdict's committee_run_dir from its cited experiment(s) when the caller did not
+    pass --committee-dir. The committee evidence lives under <exp_path>/committee* (e.g. committee1,
+    committee2). Returns the newest such dir (relative to root) for the first cited experiment, or "" if
+    none exists yet. Pure read; never creates anything. Closes the v2-parity traceability gap."""
+    for ep in (exp_paths or []):
+        cand = sorted(glob.glob(os.path.join(root, ep, "committee*")),
+                      key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+        if cand:
+            return os.path.relpath(cand[-1], root)
+    return ""
+
 def cmd_verdict_write(args):
     """Write a committee VERDICT into verdicts/<PROJ>/<date>/, REQUIRING linked experiment ids that exist.
     Enforces config green_rule (BUG-3 fix): green/promote require full committee parity.
@@ -1606,7 +1618,12 @@ def cmd_verdict_write(args):
          # evidence dir (traceability — was MISSING in v3, making integrity checks guess the path);
          # verbatim_votes_summary / key_structural_finding / disposition carry the orchestrator's distilled
          # record (present on every mature v2 verdict). All optional; empty when not supplied.
-         "committee_run_dir":getattr(args,"committee_dir","") or "",
+         # BUG-80: v2-parity traceability — mature v2 verdicts ALWAYS carry committee_run_dir; v3 verdicts
+         # left it empty (the recording step never passed --committee-dir), so this very integrity check
+         # had to GUESS the committee evidence path. When not supplied, infer it from the first cited
+         # experiment's committee* subdir (the actual .out evidence location). Defensive fallback only;
+         # an explicit --committee-dir always wins. Empty only if no committee* dir exists yet.
+         "committee_run_dir":(getattr(args,"committee_dir","") or _infer_committee_dir(root,exp_paths)),
          "verbatim_votes_summary":getattr(args,"verbatim_votes","") or "",
          "key_structural_finding":getattr(args,"finding","") or "",
          "disposition":getattr(args,"disposition","") or "",
