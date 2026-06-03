@@ -526,6 +526,18 @@ def cmd_agent_register(args):
 def cmd_heartbeat(args):
     root = inst_root(args); rd = runtime_dir(root)
     p = os.path.join(rd, "agents", f"{args.agent}.yaml")
+    # ★ BUG-99 FIX: cmd_heartbeat is an unlocked load->mutate->dump. The BUG-98 terminal-state guard
+    # only inspects the IN-MEMORY status read at the top of the call. If a `retire`/`reap` flips this
+    # agent -> retired/superseded AFTER this load but BEFORE the dump, the heartbeat re-writes the STALE
+    # (running) record over the terminal flip — wiping retired_to/retired_at and leaving BOTH this agent
+    # and its live successor `running` (the exact split-brain BUG-98 meant to prevent, just via a
+    # concurrent rather than a strictly-later heartbeat). Reproduced 8/8 in isolated /tmp.
+    # Minimal fix: serialize the RMW under a per-agent _file_lock and RE-READ the on-disk record
+    # inside the lock so the terminal flip is honored. Same O_EXCL discipline as BUG-85/next_id.
+    with _file_lock(root, f"agent_{args.agent}", stale_s=15):
+        return _heartbeat_locked(args, root, rd, p)
+
+def _heartbeat_locked(args, root, rd, p):
     rec = load_yaml(p) or {}
     if not rec.get("agent_id"):
         # tolerate heartbeat-before-register (auto-create minimal); keep any role we have
