@@ -1484,6 +1484,17 @@ def cmd_gpu_task_submit(args):
         sys.exit(f"❌ {args.exp} is not committee_approved — only committee-greenlit experiments enter the GPU "
                  f"task channel (--force, or open a window: ros gpu-approve-window --hours N).")
     if _win and not exp.get("committee_approved"): print(f"   ⏱️ GPU auto-approve window OPEN (until {_until}) — committee gate waived for {args.exp}.")
+    # ★ BUG-90 FIX: refuse a fresh GPU task submit for an exp ALREADY running on a GPU. The channel
+    # dedup_keys=["exp_id"] only de-dups UN-acked tasks; once a coordinator pulls+acks the task the exp
+    # goes status=running, and a second `gpu-task submit --exp X` (orchestrator retry / restart / second
+    # action) slips past dedup -> a NEW GT task -> a second coordinator pulls it -> the SAME experiment
+    # runs on TWO GPUs at once (lease contention, double GPU burn, racing result submits). The legit
+    # fault-retry path is unaffected: a faulted run is set status=faulted (lease released) before re-dispatch,
+    # so only a genuinely in-flight running exp is blocked. --force still overrides (e.g. confirmed-dead lease).
+    if exp.get("status") == "running" and not args.force:
+        sys.exit(f"❌ {args.exp} is already status=running (in-flight on a GPU, lease={exp.get('node_lease','')!r}) "
+                 f"— refusing to submit a duplicate task that would re-run it on a second GPU. If the run is "
+                 f"genuinely dead, fault it (`ros exp fault {args.exp}`) to release the lease, or --force.")
     floor = int(args.host_mem_floor if args.host_mem_floor is not None
                 else (exp.get("resource_budget") or {}).get("host_mem_floor_gb", 0) or 0)
     gt = args.gpu_type or "any"
