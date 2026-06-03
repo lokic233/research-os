@@ -662,6 +662,15 @@ def cmd_exp_dispatch(args):
         if held and held != exp.get("exp_id"):
             sys.exit(f"❌ SAFETY: node '{args.node}' already leased to {held} — refusing to double-book. "
                      f"Release it first (ros gpu release --node {args.node}) or wait for completion.")
+        # ★ BUG-105: also refuse if THIS EXP is already leased on ANOTHER node. BUG-104 locked the per-node
+        # check (no two exps on one node) but two concurrent dispatches of the SAME exp to DIFFERENT nodes
+        # both passed -> leases={h100a:EXP-X, h100b:EXP-X} = the SAME experiment double-dispatched across
+        # nodes (double GPU burn, racing result submits — the very hazard BUG-104 set out to close). The exp
+        # is a single unit of work; it may hold at most ONE node lease at a time.
+        _other = [n for n, e in (q.get("leases", {}) or {}).items() if e == exp.get("exp_id") and n != args.node]
+        if _other:
+            sys.exit(f"❌ SAFETY: exp {exp.get('exp_id')} is ALREADY leased on node(s) {_other} — refusing to "
+                     f"dispatch the same experiment to a second GPU. Release the other lease or wait for completion.")
         dump_yaml(ef, exp)
         q.setdefault("leases", {})[args.node] = exp.get("exp_id")
         dump_yaml(_gpu_queue_path(root), q)
