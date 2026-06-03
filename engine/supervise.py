@@ -188,6 +188,17 @@ def reap(H, root, *, apply=False, grace_min=45, converged_pids=None):
                     if new_status == "superseded" and succ:
                         task_update(H, root, t["task_id"], assignee=succ.get("agent_id"), by="reaper",
                                     note=f"reassigned from superseded {a.get('agent_id')} -> {succ.get('agent_id')}")
+                        # BUG-102: a task that is BOTH assigned-to AND parented-by the superseded agent
+                        # only matched this assignee branch (the parent-reparent branch below is an `elif`),
+                        # so its `parent` field was left dangling at the now-superseded agent — fragmenting
+                        # the supervision tree exactly as BUG-49 fixed for agent children. Move the parent
+                        # edge to the live successor too (same continuation), so no task hangs off a dead node.
+                        if t.get("parent") == a.get("agent_id"):
+                            _pp = _task_path(H, root, t["task_id"]); _pr = H["load_yaml"](_pp, {}) or {}
+                            _pr["parent"] = succ.get("agent_id"); _pr["updated_at"] = H["NOW"]()
+                            _pr.setdefault("history", []).append({"ts": H["NOW"](), "event": "reparent", "by": "reaper",
+                                "note": f"supervisor {a.get('agent_id')} superseded -> {succ.get('agent_id')} (dual assignee+parent)"})
+                            H["dump_yaml"](_pp, _pr)
                     elif new_status == "retired":
                         # BUG-96: a CLEAN retire (converged project / no project, "no successor needed",
                         # deliberately NO AGENT_DOWN) must NOT orphan its leftover open tasks + emit a
