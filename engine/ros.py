@@ -1203,13 +1203,18 @@ def cmd_exp_gc(args):
             _owner = e.get("ran_by") or e.get("dispatched_by") or ""
             if _owner:
                 try:
+                    # BUG-89: use a distinct loop var (NOT `_t`) — `_t` is the `time` module imported at
+                    # the top of cmd_exp_gc (age-of-staleness check). The old `for _t in task_list(...)`
+                    # REBOUND `_t` to a task dict, shadowing the module; any later `_t.time()` in the
+                    # apply loop (e.g. a future per-orphan staleness re-check) would crash with
+                    # AttributeError. Latent today (no _t.time() after the rebind), fixed defensively.
                     import supervise as _sup; _H=_sup_helpers()
-                    for _t in _sup.task_list(_H, root):
-                        if _t.get("assignee")==_owner and _t.get("status") in ("open","active"):
-                            _sup.task_update(_H, root, _t["task_id"], status="done", by="exp-gc",
+                    for _tk in _sup.task_list(_H, root):
+                        if _tk.get("assignee")==_owner and _tk.get("status") in ("open","active"):
+                            _sup.task_update(_H, root, _tk["task_id"], status="done", by="exp-gc",
                                              note=f"orphan EXP {eid} retired by gc (assignee {_owner} never completed)",
                                              _internal=True)
-                            print(f"   closed orphan task {_t['task_id']} (assignee {_owner}, exp gc-retired)")
+                            print(f"   closed orphan task {_tk['task_id']} (assignee {_owner}, exp gc-retired)")
                 except Exception:
                     pass
     if not args.apply: print("   (dry-run; re-run with --apply to retire)")
