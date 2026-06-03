@@ -1781,10 +1781,30 @@ def cmd_gpu_result_submit(args):
             lease = exp.get("node_lease", "")
             if lease and ":" in lease:
                 lnode = lease.split(":", 1)[0]
-                q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
-                if q.get("leases", {}).get(lnode) == exp.get("exp_id"):
-                    q["leases"].pop(lnode, None); dump_yaml(_gpu_queue_path(root), q)
-                    print(f"   ⚠️ FAULT: auto-released node {lnode} lease (was {exp.get('exp_id')}).")
+                # ★ BUG-114: this fault-path lease release was UNLOCKED — missed by the BUG-109 gpu_queue
+                # sweep. It writes the SAME leases map that cmd_exp_dispatch / cmd_exp_fault (BUG-109) /
+                # cmd_exp_complete (BUG-109) / cmd_gpu_queue / poll / release all serialize under
+                # _file_lock(root,"gpu_queue"). Unlocked, a faulter that read {node:exp} (guard passes)
+                # then dumped AFTER a concurrent LOCKED dispatcher claimed that node for a NEW exp would
+                # erase the dispatcher's fresh lease -> node looks free -> double-dispatch (the very
+                # BUG-104/105/109 lease-clobber hazard). Serialize under the SAME queue lock + RE-READ
+                # inside so the guard sees the dispatcher's claim and DEFERS; unlocked fallback only if
+                # _file_lock unavailable (mirror cmd_exp_fault BUG-109).
+                try:
+                    _q_lock = _file_lock(root, "gpu_queue", stale_s=30)
+                except Exception:
+                    _q_lock = None
+                if _q_lock is not None:
+                    with _q_lock:
+                        q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
+                        if q.get("leases", {}).get(lnode) == exp.get("exp_id"):
+                            q["leases"].pop(lnode, None); dump_yaml(_gpu_queue_path(root), q)
+                            print(f"   ⚠️ FAULT: auto-released node {lnode} lease (was {exp.get('exp_id')}).")
+                else:
+                    q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
+                    if q.get("leases", {}).get(lnode) == exp.get("exp_id"):
+                        q["leases"].pop(lnode, None); dump_yaml(_gpu_queue_path(root), q)
+                        print(f"   ⚠️ FAULT: auto-released node {lnode} lease (was {exp.get('exp_id')}).")
             if exp.get("status") == "running":
                 exp["status"] = "faulted"; exp["result_summary"] = (args.summary or "")[:200]
                 exp["node_lease"] = ""; dump_yaml(ef, exp)
