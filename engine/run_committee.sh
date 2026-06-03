@@ -41,13 +41,17 @@ run_one(){ # role backend
     reviewer_block="
 
 === REVIEWER VOTES TO AGGREGATE (read these; do not re-review) ==="
-    for ro in "$OUT"/*.out; do
-      rn="$(basename "$ro" .out)"
+    # BUG-77: aggregate ONLY the CONFIGURED reviewer roles (source of truth = MEMBERS_FILE), NOT a blind
+    # *.out glob. A stale .out from a removed/renamed role (config change, or a resubmit into a dirty OUT
+    # dir) was silently folded into the chair's packet as a phantom committee vote — the same integrity
+    # hole BUG-21/22 closed for the completion gate, left open here. Now the chair sees exactly the real
+    # committee, never an orphan .out.
+    for rn in $(awk '{print $1}' "$MEMBERS_FILE"); do
       [ "$rn" = "area_chair" ] && continue
       reviewer_block="$reviewer_block
 
 --- $rn ---
-$(cat "$ro" 2>/dev/null)"
+$(cat "$OUT/${rn}.out" 2>/dev/null)"
     done
   fi
   full="$sysp
