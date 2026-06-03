@@ -351,29 +351,74 @@ def cmd_exp_complete(args):
     if cid:
         cf = find_obj(root, "claims", cid); claim = load_yaml(cf) if cf else None
         if claim:
-            # BUG-25 GUARD: never let a stray experiment KILL/weaken a PROMOTED (6/6-GREEN) claim without
-            # explicit override. A promoted claim is near-immutable; a mis-bound exp must not erase a top result.
-            if args.effect in ("kill","weaken") and claim.get("status")=="promoted" and not args.force_demote:
-                sys.exit(f"❌ REFUSED: {cid} is PROMOTED (6/6 GREEN) — a '{args.effect}' experiment will not "
-                         f"auto-demote it. If this exp genuinely overturns a promoted result, re-run with "
-                         f"--force-demote (explicit) AND it should go through a fresh committee, not a lone exp. "
-                         f"(Likely cause: the experiment was mis-bound to {cid}; rebind it to the correct claim.)")
-            entry = {"exp_id": args.exp, "summary": args.summary, "data_path": exp["artifacts_path"]}
-            if args.effect in ("kill","weaken"): claim["negative_evidence"].append(entry)
-            else: claim["supporting_evidence"].append(entry)
-            if args.effect == "kill": claim["status"] = "killed"
-            elif args.effect == "weaken": claim["status"] = "weakened"
-            elif args.effect == "promote": claim["status"] = "promoted"
-            # lifecycle: experiment done -> evidence_ready (awaiting review) unless killed
-            claim.setdefault("active_experiments", [])
-            if args.exp in claim["active_experiments"]: claim["active_experiments"].remove(args.exp)
-            if args.effect == "kill":
-                claim["lifecycle_state"] = "done"; claim["next_action"] = "killed -> cemetery; no further action"
+            # ★ BUG-107: this claim ledger update was an UNLOCKED load->mutate->dump (READ above ->
+            # mutate -> dump_yaml below). Two experiments completing against the SAME claim at once
+            # (realistic on multi-GPU: an H100 exp and an MI350X exp bound to one claim both finish)
+            # each read the same on-disk claim, append THEIR evidence + remove THEIR exp from
+            # active_experiments, and the LAST dump wins — silently erasing the other completer's
+            # evidence entry AND leaving a STALE active_experiments back-link (the claim looks like it
+            # still has an in-flight exp forever -> the bogus "RESEED?/experiment_running, no live
+            # researcher" lane signal). Same lost-update class as BUG-106 (task ledger), BUG-99/101
+            # (agent/gpu_queue), BUG-59/97 (channel). Reproduced 20/20 lost-evidence + 20/20
+            # stale-backlink in isolated /tmp. Minimal fix (no new mechanism): serialize the claim RMW
+            # under the same per-object _file_lock O_EXCL discipline and RE-READ the claim on disk
+            # INSIDE the lock so each completer composes on the latest committed state. Falls back to the
+            # old unlocked path only if _file_lock is unavailable.
+            try:
+                _claim_lock = _file_lock(root, f"claim_{cid}", stale_s=15)
+            except Exception:
+                _claim_lock = None
+            if _claim_lock is not None:
+                with _claim_lock:
+                    fresh = load_yaml(cf)  # RE-READ inside the lock — compose on latest committed state
+                    if fresh: claim = fresh
+                    # BUG-25 GUARD: never let a stray experiment KILL/weaken a PROMOTED (6/6-GREEN) claim
+                    # without explicit override (re-checked against the freshly re-read state).
+                    if args.effect in ("kill","weaken") and claim.get("status")=="promoted" and not args.force_demote:
+                        sys.exit(f"❌ REFUSED: {cid} is PROMOTED (6/6 GREEN) — a '{args.effect}' experiment will not "
+                                 f"auto-demote it. If this exp genuinely overturns a promoted result, re-run with "
+                                 f"--force-demote (explicit) AND it should go through a fresh committee, not a lone exp. "
+                                 f"(Likely cause: the experiment was mis-bound to {cid}; rebind it to the correct claim.)")
+                    entry = {"exp_id": args.exp, "summary": args.summary, "data_path": exp["artifacts_path"]}
+                    claim.setdefault("supporting_evidence", []); claim.setdefault("negative_evidence", [])
+                    if args.effect in ("kill","weaken"): claim["negative_evidence"].append(entry)
+                    else: claim["supporting_evidence"].append(entry)
+                    if args.effect == "kill": claim["status"] = "killed"
+                    elif args.effect == "weaken": claim["status"] = "weakened"
+                    elif args.effect == "promote": claim["status"] = "promoted"
+                    # lifecycle: experiment done -> evidence_ready (awaiting review) unless killed
+                    claim.setdefault("active_experiments", [])
+                    if args.exp in claim["active_experiments"]: claim["active_experiments"].remove(args.exp)
+                    if args.effect == "kill":
+                        claim["lifecycle_state"] = "done"; claim["next_action"] = "killed -> cemetery; no further action"
+                    else:
+                        claim["lifecycle_state"] = "evidence_ready"
+                        claim["next_action"] = f"review evidence from {args.exp}; convene committee if candidate-grade"
+                    claim["last_updated"] = NOW()
+                    dump_yaml(cf, claim)
             else:
-                claim["lifecycle_state"] = "evidence_ready"
-                claim["next_action"] = f"review evidence from {args.exp}; convene committee if candidate-grade"
-            claim["last_updated"] = NOW()
-            dump_yaml(cf, claim)
+                # fallback: old unlocked path (only if _file_lock unavailable in this build)
+                if args.effect in ("kill","weaken") and claim.get("status")=="promoted" and not args.force_demote:
+                    sys.exit(f"❌ REFUSED: {cid} is PROMOTED (6/6 GREEN) — a '{args.effect}' experiment will not "
+                             f"auto-demote it. If this exp genuinely overturns a promoted result, re-run with "
+                             f"--force-demote (explicit) AND it should go through a fresh committee, not a lone exp. "
+                             f"(Likely cause: the experiment was mis-bound to {cid}; rebind it to the correct claim.)")
+                entry = {"exp_id": args.exp, "summary": args.summary, "data_path": exp["artifacts_path"]}
+                claim.setdefault("supporting_evidence", []); claim.setdefault("negative_evidence", [])
+                if args.effect in ("kill","weaken"): claim["negative_evidence"].append(entry)
+                else: claim["supporting_evidence"].append(entry)
+                if args.effect == "kill": claim["status"] = "killed"
+                elif args.effect == "weaken": claim["status"] = "weakened"
+                elif args.effect == "promote": claim["status"] = "promoted"
+                claim.setdefault("active_experiments", [])
+                if args.exp in claim["active_experiments"]: claim["active_experiments"].remove(args.exp)
+                if args.effect == "kill":
+                    claim["lifecycle_state"] = "done"; claim["next_action"] = "killed -> cemetery; no further action"
+                else:
+                    claim["lifecycle_state"] = "evidence_ready"
+                    claim["next_action"] = f"review evidence from {args.exp}; convene committee if candidate-grade"
+                claim["last_updated"] = NOW()
+                dump_yaml(cf, claim)
             note.append(f"claim {cid} -> {claim['status']}")
             # auto-cemetery on kill
             if args.effect == "kill":
