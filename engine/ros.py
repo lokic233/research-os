@@ -342,9 +342,26 @@ def cmd_exp_complete(args):
     _lease = exp.get("node_lease", "")
     if _lease and ":" in _lease:
         _lnode = _lease.split(":", 1)[0]
-        q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
-        if q.get("leases", {}).get(_lnode) == exp.get("exp_id"):
-            q["leases"].pop(_lnode, None); dump_yaml(_gpu_queue_path(root), q)
+        # ★ BUG-109: this lease-release RMW on gpu_queue.yaml was UNLOCKED while cmd_exp_dispatch
+        # writes the SAME leases map under _file_lock(root,"gpu_queue") (BUG-104/105). An unlocked
+        # release that read the pre-dispatch queue could dump_yaml AFTER a concurrent locked dispatch,
+        # clobbering the dispatcher's fresh {node:EXP-NEW} lease -> node looks free -> reopens the
+        # BUG-105 double-dispatch hazard (reproduced 8/20 lost dispatch-leases). Serialize under the
+        # SAME queue lock + RE-READ inside it so the release composes on the latest committed leases.
+        # Old unlocked path only if _file_lock is unavailable (mirror BUG-107).
+        try:
+            _q_lock = _file_lock(root, "gpu_queue", stale_s=30)
+        except Exception:
+            _q_lock = None
+        if _q_lock is not None:
+            with _q_lock:
+                q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
+                if q.get("leases", {}).get(_lnode) == exp.get("exp_id"):
+                    q["leases"].pop(_lnode, None); dump_yaml(_gpu_queue_path(root), q)
+        else:
+            q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
+            if q.get("leases", {}).get(_lnode) == exp.get("exp_id"):
+                q["leases"].pop(_lnode, None); dump_yaml(_gpu_queue_path(root), q)
     # propagate to claim ledger
     cid = exp.get("claim_id")
     note = []
@@ -739,10 +756,27 @@ def cmd_exp_fault(args):
     lnode = args.node or (lease.split(":",1)[0] if lease and ":" in lease else "")
     released = None
     if lnode:
-        q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
-        # only release if THIS exp holds it (don't steal another exp's lease)
-        if q.get("leases", {}).get(lnode) in (exp.get("exp_id"), None) or q.get("leases", {}).get(lnode) == args.exp:
-            released = q.get("leases", {}).pop(lnode, None); dump_yaml(_gpu_queue_path(root), q)
+        # ★ BUG-109: same unlocked gpu_queue lease-release hazard as cmd_exp_complete. The fault path
+        # releases a lease on the SAME leases map that cmd_exp_dispatch writes under _file_lock(root,
+        # "gpu_queue") (BUG-104/105). Unlocked, a fault's dump_yaml can land AFTER a concurrent locked
+        # dispatch and erase the dispatcher's fresh lease -> node looks free -> double-dispatch reopens
+        # (the very hazard BUG-75 fault-recovery + BUG-104/105 exist to prevent). Serialize under the
+        # SAME queue lock + RE-READ inside it; unlocked fallback only if _file_lock unavailable.
+        try:
+            _q_lock = _file_lock(root, "gpu_queue", stale_s=30)
+        except Exception:
+            _q_lock = None
+        if _q_lock is not None:
+            with _q_lock:
+                q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
+                # only release if THIS exp holds it (don't steal another exp's lease)
+                if q.get("leases", {}).get(lnode) in (exp.get("exp_id"), None) or q.get("leases", {}).get(lnode) == args.exp:
+                    released = q.get("leases", {}).pop(lnode, None); dump_yaml(_gpu_queue_path(root), q)
+        else:
+            q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
+            # only release if THIS exp holds it (don't steal another exp's lease)
+            if q.get("leases", {}).get(lnode) in (exp.get("exp_id"), None) or q.get("leases", {}).get(lnode) == args.exp:
+                released = q.get("leases", {}).pop(lnode, None); dump_yaml(_gpu_queue_path(root), q)
     exp["status"] = "faulted"; exp["node_lease"] = ""
     exp["faulted_at"] = NOW(); exp["fault_reason"] = args.reason or "GPU run faulted (no result)"
     dump_yaml(ef, exp)
@@ -1941,11 +1975,17 @@ def cmd_claim_advance(args):
     if args.state not in VALID_LIFECYCLE:
         sys.exit(f"❌ state must be one of {sorted(VALID_LIFECYCLE)}")
     c=load_yaml(cf); old=c.get("lifecycle_state","?")
-    c["lifecycle_state"]=args.state
-    if args.next is not None: c["next_action"]=args.next
-    if args.blocking is not None: c["blocking_on"]=args.blocking
-    if args.state!="blocked": c["blocking_on"]=c.get("blocking_on","") if args.blocking else ""
-    c["last_updated"]=NOW(); dump_yaml(cf,c)
+    # ★ BUG-108: serialize the claim RMW under the same per-claim _file_lock as BUG-107 (cmd_exp_complete)
+    # + RE-READ inside, so a concurrent exp-complete (evidence append) / verdict-write (verdict_history)
+    # on the SAME claim isn't clobbered by this lifecycle flip (last-write-wins lost update). No new mechanism.
+    cid_lock = c.get("claim_id", args.claim)
+    with _file_lock(root, f"claim_{cid_lock}", stale_s=15):
+        c=load_yaml(cf) or c; old=c.get("lifecycle_state", old)
+        c["lifecycle_state"]=args.state
+        if args.next is not None: c["next_action"]=args.next
+        if args.blocking is not None: c["blocking_on"]=args.blocking
+        if args.state!="blocked": c["blocking_on"]=c.get("blocking_on","") if args.blocking else ""
+        c["last_updated"]=NOW(); dump_yaml(cf,c)
     print(f"✅ {args.claim}: {old} -> {args.state}")
     if c.get("next_action"): print(f"   next: {c['next_action']}")
 
