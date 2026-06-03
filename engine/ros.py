@@ -1536,8 +1536,17 @@ def cmd_verdict_write(args):
         # validates the EXACT configured member set is covered, each role appears once, each votes green,
         # and no unknown roles are present. The configured member list is the source of truth.
         member_roles=[ (m.get("role") or "").strip() for m in members if (m.get("role") or "").strip() ]
-        if not member_roles: member_roles=["novelty_killer","systems_reviewer","evaluation_prosecutor",
-                                           "theory_skeptic","product_realist","area_chair"]
+        _CANON=["novelty_killer","systems_reviewer","evaluation_prosecutor",
+                "theory_skeptic","product_realist","area_chair"]
+        # ★ BUG-78 FIX (corrupt-config integrity floor): a torn/corrupt config can YAML-salvage
+        # (BUG-10) into a partial committee — e.g. members=[{role:x}] + green_rule=None — which
+        # previously let a degraded set (or even 1/1) pass as a genuine green with override_rule:false.
+        # A corrupt config must NEVER SHRINK the gate below the battle-tested floor. If the config is
+        # suspect (empty member list, OR fewer members than canon, OR green_rule missing — all
+        # fingerprints of a torn config), fall back to the canonical 6-member quorum. A legitimately
+        # smaller committee must be configured with an explicit valid green_rule AND >= canon members.
+        if (not member_roles) or (len(member_roles) < len(_CANON)) or (not rule):
+            member_roles=list(_CANON); rule=rule or "unanimous"
         nmembers=len(member_roles)
         # normalize parsed roles/votes
         vote_by_role={}
