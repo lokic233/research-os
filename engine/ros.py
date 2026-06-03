@@ -295,9 +295,28 @@ def cmd_exp_complete(args):
     if not exp: sys.exit(f"❌ {args.exp} not found.")
     VALID = {"kill","weaken","keep-exploring","promote","archive","support"}
     if args.effect not in VALID: sys.exit(f"❌ effect must be one of {VALID}")
-    exp["status"] = "completed"; exp["result_effect"] = args.effect
-    exp["result_summary"] = args.summary; exp["completed_at"] = NOW()
-    dump_yaml(ef, exp)
+    # ★ BUG-110: the experiment.yaml RMW itself was UNLOCKED (BUG-109 only locked the gpu_QUEUE lease, not
+    # the exp RECORD). If a `complete` races a `fault`/reaper/dispatch-release on the SAME exp, the slower
+    # writer dumps its STALE in-memory copy and clobbers the whole record -> reproduced status=completed
+    # WITH a stale node_lease still set (phantom-BUSY node / lease leak = the BUG-75 hazard), 1-2/20 in
+    # /tmp. Same lost-update class as BUG-106/107/108/109. Fix: serialize this RMW under a per-exp
+    # _file_lock + RE-READ inside so the completer composes on the latest committed exp record (e.g. a
+    # node_lease the dispatcher just set, or a fault that already cleared it). Unlocked fallback only if
+    # _file_lock unavailable (mirror BUG-107/109).
+    try:
+        _e_lock = _file_lock(root, f"exp_{args.exp}", stale_s=15)
+    except Exception:
+        _e_lock = None
+    if _e_lock is not None:
+        with _e_lock:
+            exp = load_yaml(ef) or exp
+            exp["status"] = "completed"; exp["result_effect"] = args.effect
+            exp["result_summary"] = args.summary; exp["completed_at"] = NOW()
+            dump_yaml(ef, exp)
+    else:
+        exp["status"] = "completed"; exp["result_effect"] = args.effect
+        exp["result_summary"] = args.summary; exp["completed_at"] = NOW()
+        dump_yaml(ef, exp)
     # ★ BUG-60 FIX (anti-sprawl / false-DEAD): when a researcher finishes its experiment, mark the OWNING
     # RESEARCHER AGENT 'completed' if it has no other pending/running experiment. Previously exp complete
     # updated the experiment + claim but NEVER the agent, so a finished researcher lingered status:running,
@@ -777,9 +796,24 @@ def cmd_exp_fault(args):
             # only release if THIS exp holds it (don't steal another exp's lease)
             if q.get("leases", {}).get(lnode) in (exp.get("exp_id"), None) or q.get("leases", {}).get(lnode) == args.exp:
                 released = q.get("leases", {}).pop(lnode, None); dump_yaml(_gpu_queue_path(root), q)
-    exp["status"] = "faulted"; exp["node_lease"] = ""
-    exp["faulted_at"] = NOW(); exp["fault_reason"] = args.reason or "GPU run faulted (no result)"
-    dump_yaml(ef, exp)
+    # ★ BUG-110: lock + RE-READ the experiment.yaml RMW (same as cmd_exp_complete). The lease-release
+    # above is serialized under the gpu_QUEUE lock (BUG-109), but the exp RECORD write below was UNLOCKED
+    # -> a concurrent `complete` could clobber this faulted state (or vice-versa) with a stale copy,
+    # leaving a "completed" exp still holding a node_lease (phantom-BUSY). Serialize under the per-exp lock.
+    try:
+        _e_lock = _file_lock(root, f"exp_{args.exp}", stale_s=15)
+    except Exception:
+        _e_lock = None
+    if _e_lock is not None:
+        with _e_lock:
+            exp = load_yaml(ef) or exp
+            exp["status"] = "faulted"; exp["node_lease"] = ""
+            exp["faulted_at"] = NOW(); exp["fault_reason"] = args.reason or "GPU run faulted (no result)"
+            dump_yaml(ef, exp)
+    else:
+        exp["status"] = "faulted"; exp["node_lease"] = ""
+        exp["faulted_at"] = NOW(); exp["fault_reason"] = args.reason or "GPU run faulted (no result)"
+        dump_yaml(ef, exp)
     print(f"⚠️ {args.exp} marked FAULTED ({exp['fault_reason']}); lease {released or '(none)'} released on {lnode or '?'}.")
     print(f"   re-dispatchable: ros exp dispatch --exp {args.exp} --node <node> (status faulted is accepted).")
 
