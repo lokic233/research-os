@@ -1902,18 +1902,26 @@ def cmd_verdict_write(args):
                          f"non-green: {non_green}.")
     # BUG-18 fix: idempotency — if an identical verdict (same claim+experiments+final) already exists,
     # do NOT create a duplicate (guards against harness/transport retries of the same tool call).
-    if not getattr(args, "allow_dup", False):
+    # ★ BUG-111: that dedup guard was a CHECK-THEN-ACT race — two retried identical verdict writes both
+    # passed the UNLOCKED dedup glob before either DUMPED its file, then both next_id+dump -> 2 distinct
+    # VERDICT files for the SAME adjudication (reproduced 20/20 in isolated /tmp). Same check-then-act
+    # class as BUG-104/105 (dispatch lease). Fix (no new mechanism): serialize the dedup-RESCAN through
+    # the initial DUMP under a per-claim _file_lock so the second writer's rescan SEES the first writer's
+    # just-dumped file. Unlocked fallback only if _file_lock unavailable (mirror BUG-107/109/110).
+    import datetime as _d
+    def _dedup_hit():
+        if getattr(args, "allow_dup", False):
+            return False
         for vf in glob.glob(reg_dir(root,"verdicts","**","VERDICT-*.yaml"),recursive=True):
             ev=load_yaml(vf,{}) or {}
             if (ev.get("claim_id")==args.claim and ev.get("final_verdict")==args.final
                     and sorted(ev.get("experiment_ids") or [])==sorted(exp_ids)):
                 print(f"↩︎ idempotent: {ev.get('verdict_id')} already records {args.final} for {args.claim} "
                       f"citing {exp_ids} — not creating a duplicate. (use --allow-dup to force.)")
-                return
-    vid=next_id(root,"verdicts","VERDICT")
-    import datetime as _d
-    date=_valid_date(args.date)
-    obj={"verdict_id":vid,"claim_id":args.claim,"project_id":pid,"date":date,
+                return True
+        return False
+    def _mk_verdict_obj(vid, date):
+        return {"verdict_id":vid,"claim_id":args.claim,"project_id":pid,"date":date,
          "experiment_ids":exp_ids,"experiment_paths":exp_paths,
          "committee_version":args.committee_version or comm.get("rubric_version","v001"),"prompt_versions":{},
          "reviewer_votes":parsed,"green_rule":rule,
@@ -1940,7 +1948,28 @@ def cmd_verdict_write(args):
          "key_structural_finding":getattr(args,"finding","") or "",
          "disposition":getattr(args,"disposition","") or "",
          "created_at":NOW()}
-    d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
+    # ★ BUG-111: hold a per-claim lock across dedup-RESCAN -> next_id -> initial DUMP so a concurrent
+    # retried writer's rescan sees the first writer's just-written file (no new mechanism; mirrors the
+    # O_EXCL _file_lock discipline of BUG-104/107/109/110). Unlocked fallback if _file_lock unavailable.
+    try:
+        _v_lock = _file_lock(root, f"verdict_dedup_{args.claim}", stale_s=15)
+    except Exception:
+        _v_lock = None
+    if _v_lock is not None:
+        with _v_lock:
+            if _dedup_hit():
+                return
+            vid=next_id(root,"verdicts","VERDICT")
+            date=_valid_date(args.date)
+            obj=_mk_verdict_obj(vid,date)
+            d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
+    else:
+        if _dedup_hit():
+            return
+        vid=next_id(root,"verdicts","VERDICT")
+        date=_valid_date(args.date)
+        obj=_mk_verdict_obj(vid,date)
+        d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
     # back-link claim + experiments
     # ★ BUG-108: serialize this claim back-link RMW under the per-claim _file_lock (same discipline as
     # BUG-107 cmd_exp_complete) + RE-READ inside, so a concurrent exp-complete / claim_advance on the SAME
