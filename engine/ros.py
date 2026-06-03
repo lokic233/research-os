@@ -1593,6 +1593,14 @@ def cmd_verdict_write(args):
          "required_evidence":[x.strip() for x in (args.required or "").split(";") if x.strip()],
          "map_delta_proposals":[x.strip() for x in (args.map_delta or "").split(";") if x.strip()],
          "baseline_requirements":[x.strip() for x in (args.baselines or "").split(";") if x.strip()],
+         # v2-parity audit/narrative fields (BUG-76): committee_run_dir links the verdict to its committee
+         # evidence dir (traceability — was MISSING in v3, making integrity checks guess the path);
+         # verbatim_votes_summary / key_structural_finding / disposition carry the orchestrator's distilled
+         # record (present on every mature v2 verdict). All optional; empty when not supplied.
+         "committee_run_dir":getattr(args,"committee_dir","") or "",
+         "verbatim_votes_summary":getattr(args,"verbatim_votes","") or "",
+         "key_structural_finding":getattr(args,"finding","") or "",
+         "disposition":getattr(args,"disposition","") or "",
          "created_at":NOW()}
     d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
     # back-link claim + experiments
@@ -2504,6 +2512,11 @@ def main():
     vwr.add_argument("--required",help="required_evidence to advance, ';'-separated")
     vwr.add_argument("--map-delta",dest="map_delta",help="academic-map delta proposals, ';'-separated")
     vwr.add_argument("--baselines",help="baseline_requirements, ';'-separated")
+    # v2-parity audit/narrative fields (BUG-76)
+    vwr.add_argument("--committee-dir",dest="committee_dir",help="committee_run_dir: path to this verdict's committee evidence (traceability)")
+    vwr.add_argument("--verbatim-votes",dest="verbatim_votes",help="verbatim_votes_summary: quoted per-reviewer rationale")
+    vwr.add_argument("--finding",help="key_structural_finding: the distilled takeaway")
+    vwr.add_argument("--disposition",help="disposition: the lifecycle decision (e.g. 'KILL RATIFIED -> DEAD-NNNN', 'yellow-advance', 'converged')")
     vwr.add_argument("--allow-dup",dest="allow_dup",action="store_true",help="bypass idempotency dedup (force a duplicate verdict)")
     vwr.add_argument("--approves-exp",dest="approves_exp",help="EXP-id(s) the committee greenlights for the GPU queue (autonomous dispatch)")
     vwr.set_defaults(fn=cmd_verdict_write)
