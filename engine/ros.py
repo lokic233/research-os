@@ -1356,10 +1356,29 @@ def cmd_exp_gc(args):
         print(f"  {eid} (claim {cid})")
         if args.apply:
             # clear from claim.active_experiments
+            # ★ BUG-112: this claim RMW was UNLOCKED while the claim WRITERS (cmd_exp_complete BUG-107,
+            # cmd_verdict_write BUG-108, cmd_claim_advance) all serialize under _file_lock(root,f'claim_{cid}').
+            # An unlocked gc that read the claim before a concurrent LOCKED completer could dump its STALE
+            # copy AFTER -> clobber the completer's evidence append AND its active_experiments removal
+            # (deterministic /tmp repro: evidence=[], the completer's removed exp resurrected). Same
+            # lost-update class as BUG-109 (unlocked racer vs locked writer). Fix (no new mechanism):
+            # take the SAME per-claim lock + RE-READ inside before removing eid + dump.
             if cid:
-                cf=find_obj(root,"claims",cid); c=load_yaml(cf) if cf else None
-                if c and eid in (c.get("active_experiments") or []):
-                    c["active_experiments"].remove(eid); c["last_updated"]=NOW(); dump_yaml(cf,c)
+                cf=find_obj(root,"claims",cid)
+                if cf:
+                    try:
+                        _c_lock = _file_lock(root, f"claim_{cid}", stale_s=15)
+                    except Exception:
+                        _c_lock = None
+                    if _c_lock is not None:
+                        with _c_lock:
+                            c=load_yaml(cf)
+                            if c and eid in (c.get("active_experiments") or []):
+                                c["active_experiments"].remove(eid); c["last_updated"]=NOW(); dump_yaml(cf,c)
+                    else:
+                        c=load_yaml(cf)
+                        if c and eid in (c.get("active_experiments") or []):
+                            c["active_experiments"].remove(eid); c["last_updated"]=NOW(); dump_yaml(cf,c)
             # mark the experiment retired (keep the dir for audit; don't delete)
             ef=os.path.join(d,"experiment.yaml"); e=load_yaml(ef); e["status"]="retired"
             e["result_summary"]="retired by ros exp gc (orphan pending, never completed)"; dump_yaml(ef,e)
