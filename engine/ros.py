@@ -609,6 +609,31 @@ def cmd_exp_dispatch(args):
     print(f"   NOTE: enforce the host-RAM watchdog on BOTH allocation AND teardown; use os._exit().")
 
 
+def cmd_exp_fault(args):
+    """★ BUG-75: GPU FAULT RECOVERY primitive. A GPU run that hung/died/crashed (no result) must (a) RELEASE
+    its node lease so the (fragile) node isn't stuck BUSY forever, and (b) mark the exp 'faulted' so it is
+    re-dispatchable (cmd_exp_dispatch accepts pending|faulted). Does NOT touch the claim ledger (no result =
+    no evidence). This is what `ros progress` gpu-run-no-result tells the orchestrator to run."""
+    root = inst_root(args)
+    ef = find_obj(root, "experiments", args.exp) or glob.glob(os.path.join(root,"experiments","**",args.exp,"experiment.yaml"),recursive=True)
+    ef = ef if isinstance(ef, str) else (ef[0] if ef else None)
+    if not ef: sys.exit(f"❌ {args.exp} not found.")
+    exp = load_yaml(ef, {}) or {}
+    # release the lease (from the exp's recorded node_lease, or an explicit --node)
+    lease = exp.get("node_lease", "")
+    lnode = args.node or (lease.split(":",1)[0] if lease and ":" in lease else "")
+    released = None
+    if lnode:
+        q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
+        # only release if THIS exp holds it (don't steal another exp's lease)
+        if q.get("leases", {}).get(lnode) in (exp.get("exp_id"), None) or q.get("leases", {}).get(lnode) == args.exp:
+            released = q.get("leases", {}).pop(lnode, None); dump_yaml(_gpu_queue_path(root), q)
+    exp["status"] = "faulted"; exp["node_lease"] = ""
+    exp["faulted_at"] = NOW(); exp["fault_reason"] = args.reason or "GPU run faulted (no result)"
+    dump_yaml(ef, exp)
+    print(f"⚠️ {args.exp} marked FAULTED ({exp['fault_reason']}); lease {released or '(none)'} released on {lnode or '?'}.")
+    print(f"   re-dispatchable: ros exp dispatch --exp {args.exp} --node <node> (status faulted is accepted).")
+
 
 # ============================ progress reporting (researcher -> orchestrator) ============================
 def cmd_report(args):
@@ -2206,7 +2231,7 @@ def cmd_progress(args):
         gr_run = gpu_running_by_claim.get(cid)
         if gr_run and gr_run["age"] > gr_run["thr"]:
             stalls.append((cid, pid, "gpu-run-no-result", gr_run["age"], gr_run["thr"],
-                           f"{gr_run['exp']} running+leased {gr_run['lease']}, no result (>budget+grace) — fault+release+re-dispatch"))
+                           f"{gr_run['exp']} running+leased {gr_run['lease']}, no result (>budget+grace) — `ros exp fault --exp {gr_run['exp']}` then re-dispatch"))
 
     print(f"PROGRESS — time-since-last-real-landing across {inflight} in-flight claim(s) "
           f"(stall>{stall_min:g}m, GPU>{gpu_stall_min:g}m):")
@@ -2574,6 +2599,10 @@ def main():
     ed.add_argument("--by", help="orchestrator id"); ed.add_argument("--approve", action="store_true")
     ed.add_argument("--force", action="store_true", help="override committee-approval requirement (explicit)")
     ed.set_defaults(fn=cmd_exp_dispatch)
+    ef_ = esub.add_parser("fault", help="BUG-75: GPU fault recovery — release a stuck node lease + mark exp faulted (re-dispatchable). No claim change (no result).")
+    ef_.add_argument("--exp", required=True); ef_.add_argument("--node", help="node to release (default: the exp's recorded lease)")
+    ef_.add_argument("--reason", help="why it faulted (recorded on the exp)")
+    ef_.set_defaults(fn=cmd_exp_fault)
     # ---- supervision tree + task ledger + reaper (BUG-31..34) ----
     tk = sub.add_parser("task"); tks = tk.add_subparsers(dest="sub", required=True)
     tko = tks.add_parser("open")
