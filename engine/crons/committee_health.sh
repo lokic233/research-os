@@ -36,7 +36,13 @@ for d in "$RD"/committee_run_* "$INST"/experiments/*/*/committee* "$INST"/experi
   # committee dir with no newer verdict still fires.)
   done_mt=$(date -u -r "$st" +%s 2>/dev/null || stat -f %m "$st" 2>/dev/null || echo 0)
   newest_verdict_mt=0
-  for vf in $(grep -rl "claim_id: $claim" "$INST/registry/verdicts" 2>/dev/null); do
+  # ★ BUG-91: anchor the claim_id match. `grep -rl "claim_id: $claim"` is a SUBSTRING match — for an
+  # un-padded id (e.g. CLAIM-3) or once ids overflow the 4-digit pad (CLAIM-10000+), "claim_id: CLAIM-3"
+  # also matches "claim_id: CLAIM-37"/"CLAIM-3-..". A foreign claim's newer verdict would then falsely
+  # satisfy the BUG-79b staleness suppression and the cron would NEVER fire COMMITTEE_READY for THIS
+  # claim -> a genuinely-ready committee stalls silently (same blind-gate class BUG-79 fixed). Anchor to
+  # the full field value (line-start + exact token + optional trailing ws/EOL).
+  for vf in $(grep -rlE "^claim_id:[[:space:]]+${claim}[[:space:]]*\$" "$INST/registry/verdicts" 2>/dev/null); do
     vmt=$(date -u -r "$vf" +%s 2>/dev/null || stat -f %m "$vf" 2>/dev/null || echo 0)
     [ "$vmt" -gt "$newest_verdict_mt" ] && newest_verdict_mt=$vmt
   done
