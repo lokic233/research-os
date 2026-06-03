@@ -1321,9 +1321,14 @@ def cmd_gpu_poll(args):
         if q["leases"].get(args.node):
             print(f"{args.node} BUSY (lease {q['leases'][args.node]}); no pull."); return
         # pick next queued exp matching this node's gpu_type (or 'any'), highest priority, watchdog-safe on fragile
+        # ★ BUG-93: normalize gpu_type (strip+lower) on BOTH sides — the direct-dispatch gate (cmd_gpu_dispatch)
+        # already compares case-insensitively, but this pull predicate did an exact match, so a queued exp with
+        # gpu_type 'h100'/'H100 ' (lowercase/trailing-space) would dispatch directly yet be SKIPPED FOREVER by
+        # the pull scheduler against an 'H100' node -> silent GPU starvation. Match the direct path exactly.
+        _node_gt = (node.get("gpu_type") or "").strip().lower()
         for i in sorted(q["queue"],key=lambda x:-x.get("priority",0)):
-            gt=i.get("gpu_type","any")
-            if gt not in ("any", node.get("gpu_type")): continue
+            gt=(i.get("gpu_type","any") or "any").strip().lower()
+            if gt not in ("any", _node_gt): continue
             if node.get("fragile") and (i.get("host_mem_floor_gb",0) or 0)<=0: continue  # SAFETY: never on fragile w/o floor
             # already leased to ANOTHER node? skip (another poller claimed it) — no double dispatch
             if i.get("exp_id") in q["leases"].values(): continue
