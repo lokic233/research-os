@@ -49,6 +49,22 @@ echo "$lanes_out" | grep -E '📤|⚠️|🔬|🌱' | while IFS= read -r line; d
       rm -f "$NDIR/$pid.reseed" "$NDIR/$pid.advance" ;;
   esac
 done
+# ★ BUG-81: instance-level DESIGN? (below investing target — no PROJ id, not a per-lane line). Notify the
+# orchestrator to design new projects, ONCE per deficit-state (sentinel keyed on the deficit count so a
+# changed deficit re-notifies; clears when back at target).
+design_line="$(echo "$lanes_out" | grep 'DESIGN?')"
+if [ -n "$design_line" ]; then
+  deficit="$(echo "$design_line" | grep -oE 'below target by [0-9]+' | grep -oE '[0-9]+' | head -1)"
+  mk="$NDIR/design.$deficit"
+  if [ ! -f "$mk" ]; then
+    ROS notify --to orchestrator --event DESIGN --subject "refill-to-target" \
+      --detail "$(echo "$design_line" | sed 's/^[[:space:]]*//')" --by proj-monitor --role proj_monitor >/dev/null \
+      && { rm -f "$NDIR"/design.* 2>/dev/null; touch "$mk"; }
+    log "DESIGN? (below target by ${deficit:-?}) -> orchestrator"
+  fi
+else
+  rm -f "$NDIR"/design.* 2>/dev/null   # back at target -> clear so a future deficit re-notifies
+fi
 # clear stale sentinels for lanes that are no longer RESEED?/ADVANCE?/SEED? (state changed -> allow re-notify later)
 for mk in "$NDIR"/*.reseed "$NDIR"/*.advance "$NDIR"/*.seed; do
   [ -e "$mk" ] || continue
