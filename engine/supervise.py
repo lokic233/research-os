@@ -131,9 +131,15 @@ def reap(H, root, *, apply=False, grace_min=45, converged_pids=None):
             a["_fn"] = fn; a["_age"] = _age_min(a, now); agents.append(a)
     # freshest live agent per (project, role)
     def key(a): return (a.get("project_id", ""), a.get("role", ""))
+    # BUG-87 fix: agents with an empty/unknown role have NO role identity to inherit, so they must NOT
+    # be grouped into a shared (project,"") bucket — otherwise any fresh unknown-role agent would silently
+    # "supersede" an unrelated stale unknown-role agent, swallowing a real coverage gap WITHOUT the
+    # AGENT_DOWN notify. Only well-roled live agents are eligible to supersede; unknown-role lingerers fall
+    # through to the DEAD/retired path so genuine gaps are surfaced. (BUG-10 keeps roles from downgrading.)
+    def _has_role(a): return bool((a.get("role") or "").strip()) and (a.get("role") or "").strip() != "unknown"
     live_fresh = {}
     for a in agents:
-        if a.get("status") in ALIVE_STATES and a["_age"] <= grace_min:
+        if a.get("status") in ALIVE_STATES and a["_age"] <= grace_min and _has_role(a):
             k = key(a)
             if k not in live_fresh or a["_age"] < live_fresh[k]["_age"]:
                 live_fresh[k] = a
