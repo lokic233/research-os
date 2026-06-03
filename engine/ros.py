@@ -1908,16 +1908,21 @@ def cmd_verdict_write(args):
          "created_at":NOW()}
     d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
     # back-link claim + experiments
-    claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final,
+    # ★ BUG-108: serialize this claim back-link RMW under the per-claim _file_lock (same discipline as
+    # BUG-107 cmd_exp_complete) + RE-READ inside, so a concurrent exp-complete / claim_advance on the SAME
+    # claim isn't clobbered by this verdict_history append + status flip (last-write-wins lost update).
+    with _file_lock(root, f"claim_{args.claim}", stale_s=15):
+      claim = load_yaml(cf) or claim
+      claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final,
         **({"override_rule":True} if (args.override_rule and args.final in ("green","promote")) else {})})
-    if args.final in ("promote","kill"):
+      if args.final in ("promote","kill"):
         claim["lifecycle_state"]="done"; claim["next_action"]=f"{args.final}ed by {vid}"
         # ★ BUG-58b: mirror the claim STATUS on promote/kill so it matches the exp_complete path (which
         # sets status promoted/dead). Without this, a promote verdict left status='seed' on a top result,
         # and the BUG-25 promoted-claim demote-guard (which keys on status=='promoted') never engaged.
         if args.final=="promote": claim["status"]="promoted"
         else: claim["status"]="dead"
-    elif args.final=="green":
+      elif args.final=="green":
         # ★ BUG-58 FIX: a GREEN verdict PASSED committee (real 6/6). The old code reused the yellow/red
         # message ("address required_evidence to advance"), which made every green claim linger in `ros
         # resume` telling the orchestrator to fix evidence it had already cleared — nonsensical for a pass.
@@ -1927,10 +1932,10 @@ def cmd_verdict_write(args):
         claim["status"]="green"
         claim["next_action"]=(f"{vid}=GREEN (6/6 committee): promote (ros verdict --final promote) "
                               f"or close; any green-lift/follow-on is optional, not required")
-    else:
+      else:
         claim["lifecycle_state"]="verdict_recorded"
         claim["next_action"]=f"{vid}={args.final}: address required_evidence to advance"
-    claim["last_updated"]=NOW(); dump_yaml(cf,claim)
+      claim["last_updated"]=NOW(); dump_yaml(cf,claim)
     # ★ BUG-84: a committee KILL verdict set status=dead but NEVER buried the claim to the cemetery — only
     # the `ros exp complete --effect kill` path did. So committee-killed ideas were absent from the DEAD-*
     # dedup set, and `ros seed new` could RESURRECT them (violates Invariant 2: no cemetery idea resurrects).
