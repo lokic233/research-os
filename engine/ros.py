@@ -1560,6 +1560,10 @@ def cmd_verdict_write(args):
          "committee_version":args.committee_version or comm.get("rubric_version","v001"),"prompt_versions":{},
          "reviewer_votes":parsed,"green_rule":rule,
          "final_verdict":args.final,
+         # ★ BUG-74: record when the unanimous gate was BYPASSED via --override-rule, so a green/promote
+         # that did NOT come from a real 6/6 is never silently indistinguishable from a genuine one. An
+         # auditor (or `ros progress`/a future check) can flag override greens. False = normal gated verdict.
+         "override_rule":bool(args.override_rule and args.final in ("green","promote")),
          "fatal_objections":[x.strip() for x in (args.fatal or "").split(";") if x.strip()],
          "required_evidence":[x.strip() for x in (args.required or "").split(";") if x.strip()],
          "map_delta_proposals":[x.strip() for x in (args.map_delta or "").split(";") if x.strip()],
@@ -1567,7 +1571,8 @@ def cmd_verdict_write(args):
          "created_at":NOW()}
     d=obj_dir(root,"verdicts",pid,date); path=os.path.join(d,f"{vid}.yaml"); dump_yaml(path,obj)
     # back-link claim + experiments
-    claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final})
+    claim.setdefault("verdict_history",[]).append({"verdict_id":vid,"date":date,"result":args.final,
+        **({"override_rule":True} if (args.override_rule and args.final in ("green","promote")) else {})})
     if args.final in ("promote","kill"):
         claim["lifecycle_state"]="done"; claim["next_action"]=f"{args.final}ed by {vid}"
         # ★ BUG-58b: mirror the claim STATUS on promote/kill so it matches the exp_complete path (which
@@ -1600,6 +1605,9 @@ def cmd_verdict_write(args):
             print(f"   committee-approved {aeid} for GPU queue (via {vid})")
     print(f"✅ {vid} ({args.final}) -> {os.path.relpath(path,root)}")
     print(f"   votes: {len(parsed)}/{len(members) or 6}  cites: {', '.join(exp_ids)}  | claim {args.claim} updated")
+    if args.override_rule and args.final in ("green","promote"):
+        print(f"   ⚠️ OVERRIDE-RULE: this {args.final} BYPASSED the {rule} committee gate ({len(parsed)} vote(s)) "
+              f"— recorded as override_rule:true in the verdict (auditable). NOT a genuine 6/6.")
 
 
 VALID_LIFECYCLE={"drafted","prior_art_pending","experiment_designing","experiment_running",
