@@ -8,15 +8,40 @@
 source "$(dirname "$0")/_common.sh"
 rc=0
 RD="$(RUNTIME_DIR)"
+INST="${ROS_INSTANCE}"
 shopt -s nullglob 2>/dev/null || true
-for d in "$RD"/committee_run_*; do
+# ★ BUG-79: scan BOTH committee layouts. v2 staged committees in runtime/committee_run_<CLAIM>-*; the v3
+# orchestrator stages them under experiments/<date>/<EXP>/committeeN/. The cron previously scanned ONLY
+# the runtime path, so on v3 it ran (stamped .alive = looked healthy) but saw ZERO committees and NEVER
+# fired COMMITTEE_READY — the gate was silently blind for the entire cutover. Now we scan both; for the
+# experiments-path dirs the dir name carries the EXP, so resolve the CLAIM via the experiment.yaml.
+for d in "$RD"/committee_run_* "$INST"/experiments/*/*/committee* "$INST"/experiments/*/*/*/committee*; do
   [ -d "$d" ] || continue
   st="$d/_status.txt"; [ -f "$st" ] || continue
   status="$(cat "$st" 2>/dev/null)"
   name="$(basename "$d")"
-  claim="$(echo "$name" | grep -oE 'CLAIM-[0-9]+' | head -1)"
+  # claim id: prefer one in the dir/path name (v2 runtime style); else resolve via the EXP's experiment.yaml (v3 style)
+  claim="$(echo "$d" | grep -oE 'CLAIM-[0-9]+' | head -1)"
+  if [ -z "$claim" ]; then
+    exp="$(echo "$d" | grep -oE 'EXP-[0-9]+' | head -1)"
+    if [ -n "$exp" ]; then
+      ef="$(find "$INST/experiments" -path "*/$exp/experiment.yaml" 2>/dev/null | head -1)"
+      [ -n "$ef" ] && claim="$(grep -E '^claim_id:' "$ef" 2>/dev/null | head -1 | awk '{print $2}')"
+    fi
+  fi
   [ -n "$claim" ] || continue
-  # already notified? mark with a sentinel so we don't spam every minute
+  # ★ BUG-79b: skip a committee whose verdict is ALREADY written AFTER the committee finished — else we
+  # nag the orchestrator to "tally" a claim it already dispositioned (make-work churn). A verdict file for
+  # this claim newer than the committee's _status.txt means this pass is done. (Two-pass safe: a later
+  # committee dir with no newer verdict still fires.)
+  done_mt=$(date -u -r "$st" +%s 2>/dev/null || stat -f %m "$st" 2>/dev/null || echo 0)
+  newest_verdict_mt=0
+  for vf in $(grep -rl "claim_id: $claim" "$INST/registry/verdicts" 2>/dev/null); do
+    vmt=$(date -u -r "$vf" +%s 2>/dev/null || stat -f %m "$vf" 2>/dev/null || echo 0)
+    [ "$vmt" -gt "$newest_verdict_mt" ] && newest_verdict_mt=$vmt
+  done
+  if [ "$newest_verdict_mt" -ge "$done_mt" ] && [ "$newest_verdict_mt" -gt 0 ]; then continue; fi
+  # already notified? mark with a sentinel so we don't spam every minute (sentinel lives IN the committee dir)
   notified="$d/.v3_notified"
   case "$status" in
     ALL_COMMITTEE_DONE)
@@ -28,7 +53,7 @@ for d in "$RD"/committee_run_*; do
           --role committee_health >/dev/null && touch "$notified.incomplete"; log "INCOMPLETE $claim"; }
       else
         [ -f "$notified.ready" ] || { ROS notify --to orchestrator --event COMMITTEE_READY \
-          --subject "$claim" --detail "$name ALL_COMMITTEE_DONE — orchestrator: tally + ros verdict write" \
+          --subject "$claim" --detail "$name ($claim) ALL_COMMITTEE_DONE — orchestrator: tally + ros verdict write" \
           --by committee-health --role committee_health >/dev/null && touch "$notified.ready"; log "READY $claim"; }
       fi
       ;;
