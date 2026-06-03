@@ -79,27 +79,46 @@ def _task_path(H, root, tid):
 
 
 def task_update(H, root, tid, *, assignee=None, status=None, session=None, evidence_delta=None, by="", note="", _internal=False):
+    # BUG-106 fix: task_update was an UNLOCKED load->mutate->dump on the task record — the exact lost-update
+    # race class as BUG-59/97 (channel) and BUG-99/100/101 (agent/gpu_queue). Multiple writers concurrently
+    # mutate the SAME task ledger entry: the reaper closes/orphans/reassigns tasks (BUG-86/88/96/102), exp
+    # complete closes the owner's task (BUG-60b), handoff transfers it, and the researcher updates its own
+    # status — all via this function. Two overlapping calls each read the same on-disk record, mutate their
+    # in-memory copy, and the LAST dump wins, silently erasing the other's write (status flip, reassignment,
+    # AND every history entry in between). Reproduced 18/20 lost updates in isolated /tmp. Fix (no new
+    # mechanism): serialize the RMW under the same per-object _file_lock + O_EXCL discipline and RE-READ the
+    # record on disk INSIDE the lock so each writer composes on the latest committed state (mirrors BUG-99's
+    # heartbeat lock and BUG-101's retire flip). Falls back to the old unlocked path only if H lacks the lock
+    # (older helper bundle) so behavior is unchanged where the lock is unavailable.
     p = _task_path(H, root, tid)
-    rec = H["load_yaml"](p, {}) or {}
-    if not rec.get("task_id"):
-        raise SystemExit(f"❌ {tid} not found")
-    # BUG-46 fix: validate status against the known set (a typo'd status silently corrupts the ledger).
-    if status is not None and status not in TASK_STATES:
-        raise SystemExit(f"❌ invalid task status '{status}'. Valid: {', '.join(TASK_STATES)}")
-    # BUG-47 fix: a terminal task (done/dropped) is immutable — refuse to reopen/mutate (except internal
-    # reaper bookkeeping which never targets terminal tasks anyway).
-    if rec.get("status") in TASK_TERMINAL and not _internal:
-        raise SystemExit(f"❌ {tid} is {rec.get('status')} (terminal) — cannot modify a closed task")
-    now = H["NOW"]()
-    if assignee is not None: rec["assignee"] = assignee
-    if session is not None: rec["session_id"] = session
-    if status is not None: rec["status"] = status
-    if evidence_delta: rec["evidence_delta"] = evidence_delta
-    rec["updated_at"] = now
-    if status in ("done", "dropped"): rec["closed_at"] = now
-    rec.setdefault("history", []).append({"ts": now, "event": status or "update", "by": by, "note": note or (evidence_delta or "")})
-    H["dump_yaml"](p, rec)
-    return rec
+    _fl = H.get("_file_lock")
+
+    def _do():
+        rec = H["load_yaml"](p, {}) or {}
+        if not rec.get("task_id"):
+            raise SystemExit(f"❌ {tid} not found")
+        # BUG-46 fix: validate status against the known set (a typo'd status silently corrupts the ledger).
+        if status is not None and status not in TASK_STATES:
+            raise SystemExit(f"❌ invalid task status '{status}'. Valid: {', '.join(TASK_STATES)}")
+        # BUG-47 fix: a terminal task (done/dropped) is immutable — refuse to reopen/mutate (except internal
+        # reaper bookkeeping which never targets terminal tasks anyway).
+        if rec.get("status") in TASK_TERMINAL and not _internal:
+            raise SystemExit(f"❌ {tid} is {rec.get('status')} (terminal) — cannot modify a closed task")
+        now = H["NOW"]()
+        if assignee is not None: rec["assignee"] = assignee
+        if session is not None: rec["session_id"] = session
+        if status is not None: rec["status"] = status
+        if evidence_delta: rec["evidence_delta"] = evidence_delta
+        rec["updated_at"] = now
+        if status in ("done", "dropped"): rec["closed_at"] = now
+        rec.setdefault("history", []).append({"ts": now, "event": status or "update", "by": by, "note": note or (evidence_delta or "")})
+        H["dump_yaml"](p, rec)
+        return rec
+
+    if _fl is not None:
+        with _fl(root, f"task_{tid}", stale_s=15):
+            return _do()
+    return _do()
 
 
 def task_list(H, root, *, only_open=False, only_orphans=False, project=None):
