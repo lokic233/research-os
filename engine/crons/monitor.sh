@@ -43,6 +43,14 @@ else
 fi
 # #2/#3 (agent stall + wedged-log) are reaper/liveness duties already in the engine — surface coverage gaps:
 ROS reap >/dev/null 2>&1 || true
+# ★ BUG-83: NO cron flushed v3 state to GitHub — only the orchestrator's own `ros commit` did, so between
+# its cycles, committed-but-unpushed (and uncommitted durable) work accumulated = durability risk (box dies
+# -> work lost) AND the audit kept flagging push-drift. The monitor (5-min health watchdog) now flushes:
+# a `ros commit` snapshots + pushes durable state. `ros commit` is atomic (git add -A snapshot) and no-ops
+# cleanly when nothing changed; committing an in-flight artifact is harmless (next cycle catches the rest).
+# Skip ONLY if a GPU/committee run is mid-write to avoid a noisy partial — but a push of already-committed
+# work is always safe, so we always at least flush unpushed commits.
+ROS commit -m "monitor autosave $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null 2>&1 || true
 # success = the monitor RAN its checks cleanly (escalations themselves succeeded). Stamp .alive.
 [ "$rc" -eq 0 ] && stamp_alive monitor && log "monitor cycle OK (.alive stamped)"
 exit "$rc"
