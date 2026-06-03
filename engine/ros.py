@@ -594,7 +594,11 @@ def cmd_exp_dispatch(args):
     node = next((n for n in (cfg.get("compute_nodes") or []) if n.get("name")==args.node), None)
     if not node: sys.exit(f"❌ node '{args.node}' not in config compute_nodes.")
     budget = exp.get("resource_budget", {})
-    floor = budget.get("host_mem_floor_gb", 0) or 0
+    # BUG-94: coerce on-disk host_mem_floor_gb to int — a hand-edited / older-agent-written / restored
+    # YAML can carry a STRING (e.g. "32"), and the fragile-node SAFETY gate below does `floor <= 0`,
+    # which TypeError-crashes on str. Fail SAFE: un-coercible -> 0 -> fragile gate REFUSES (never waived).
+    try: floor = int(budget.get("host_mem_floor_gb", 0) or 0)
+    except (TypeError, ValueError): floor = 0
     # SAFETY GATE: gpu_type match — never dispatch an exp to a node of the WRONG GPU type (e.g. an
     # H100-required exp onto the fragile MI350X). Exp gpu_type 'any'/empty = no constraint. --force overrides.
     exp_gt = (exp.get("gpu_type") or "").strip()
@@ -1240,7 +1244,8 @@ def cmd_gpu_queue(args):
     if not (exp.get("committee_approved") or args.force or _win):
         sys.exit(f"❌ {args.exp} is not committee_approved — only committee-greenlit experiments enter the GPU queue (--force, or ros gpu-approve-window --hours N).")
     if _win and not exp.get("committee_approved"): print(f"   ⏱️ GPU auto-approve window OPEN (until {_until}) — committee gate waived for {args.exp}.")
-    floor=(exp.get("resource_budget") or {}).get("host_mem_floor_gb",0) or 0
+    try: floor=int((exp.get("resource_budget") or {}).get("host_mem_floor_gb",0) or 0)  # BUG-94: coerce on-disk str floor -> int (fail safe to 0)
+    except (TypeError, ValueError): floor=0
     q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
     if any(i.get("exp_id")==args.exp for i in q["queue"]): print(f"already queued: {args.exp}"); return
     q["queue"].append({"exp_id":args.exp,"claim_id":exp.get("claim_id"),"gpu_type":args.gpu_type or "any",
@@ -1329,7 +1334,19 @@ def cmd_gpu_poll(args):
         for i in sorted(q["queue"],key=lambda x:-x.get("priority",0)):
             gt=(i.get("gpu_type","any") or "any").strip().lower()
             if gt not in ("any", _node_gt): continue
-            if node.get("fragile") and (i.get("host_mem_floor_gb",0) or 0)<=0: continue  # SAFETY: never on fragile w/o floor
+            # ★ BUG-94: the queue snapshot's gpu_type is whatever `ros gpu queue --gpu-type` recorded
+            # (defaults to 'any'), which can be LOOSER than the experiment's OWN declared gpu_type. The
+            # direct-dispatch path (cmd_exp_dispatch) refuses a gpu_type mismatch against the LIVE exp to
+            # protect the fragile node; the pull path only matched the loose snapshot, so an H100-only exp
+            # queued as 'any' would be PULLED onto the fragile MI350X — the exact mismatch the direct gate
+            # blocks, silently bypassed. Re-validate the LIVE exp's gpu_type here, same case-insensitive rule.
+            if gt == "any":
+                _live=glob.glob(os.path.join(root,"experiments","**",i.get("exp_id"),"experiment.yaml"),recursive=True)
+                _egt=(load_yaml(_live[0]).get("gpu_type") or "").strip().lower() if _live else ""
+                if _egt and _egt not in ("any","") and _egt != _node_gt: continue  # SAFETY: live exp needs a different GPU type
+            try: _fl = int(i.get("host_mem_floor_gb", 0) or 0)
+            except (TypeError, ValueError): _fl = 0  # BUG-94: str floor in queue YAML -> fail safe to 0
+            if node.get("fragile") and _fl <= 0: continue  # SAFETY: never on fragile w/o floor
             # already leased to ANOTHER node? skip (another poller claimed it) — no double dispatch
             if i.get("exp_id") in q["leases"].values(): continue
             cand=i; break
