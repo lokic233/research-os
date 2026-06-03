@@ -646,17 +646,25 @@ def cmd_exp_dispatch(args):
     # BUG-54 fix: dispatch must record the node lease in the SHARED gpu_queue leases map (the same map
     # `gpu status`/`gpu poll`/`gpu release` read) — otherwise the node shows FREE after dispatch and a
     # second dispatch double-books the GPU (critical on the fragile MI350X). Refuse if already leased.
-    q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
-    held = q.get("leases", {}).get(args.node)
-    if held and held != exp.get("exp_id"):
-        sys.exit(f"❌ SAFETY: node '{args.node}' already leased to {held} — refusing to double-book. "
-                 f"Release it first (ros gpu release --node {args.node}) or wait for completion.")
+    # ★ BUG-104: this check-then-act lease RMW on gpu_queue.yaml was UNLOCKED — the exact BUG-100 hazard
+    # on the dispatch path (BUG-100 hardened enqueue/release, NOT cmd_exp_dispatch). cmd_gpu_poll (BUG-85)
+    # claims a lease + removes the item under _file_lock(root,"gpu_queue"); a concurrent dispatch read a
+    # STALE no-lease snapshot, then dumped it LAST -> wiped the poller's just-written lease AND the leased
+    # exp REAPPEARED in the queue -> a second poller re-pulled it = DOUBLE GPU DISPATCH (critical on the
+    # fragile MI350X). Reproduced 10/10 lost-lease in isolated /tmp. Fix (no new mechanism): serialize the
+    # lease check+write under the SAME queue lock + RE-READ the queue inside it (mirror BUG-100).
     exp["status"] = "running"; exp["started_at"] = NOW()
     exp["dispatched_by"] = args.by or "orchestrator"
     exp["node_lease"] = f"{args.node}:{exp.get('exp_id')}"
-    dump_yaml(ef, exp)
-    q.setdefault("leases", {})[args.node] = exp.get("exp_id")
-    dump_yaml(_gpu_queue_path(root), q)
+    with _file_lock(root, "gpu_queue", stale_s=30):
+        q = load_yaml(_gpu_queue_path(root), {"queue": [], "leases": {}}) or {"queue": [], "leases": {}}
+        held = q.get("leases", {}).get(args.node)
+        if held and held != exp.get("exp_id"):
+            sys.exit(f"❌ SAFETY: node '{args.node}' already leased to {held} — refusing to double-book. "
+                     f"Release it first (ros gpu release --node {args.node}) or wait for completion.")
+        dump_yaml(ef, exp)
+        q.setdefault("leases", {})[args.node] = exp.get("exp_id")
+        dump_yaml(_gpu_queue_path(root), q)
     print(f"🚀 dispatched {args.exp} -> {args.node} ({node.get('gpu_type','?')}, fragile={bool(node.get('fragile'))})")
     print(f"   host_mem_floor={floor}GB  budget={budget}  by={exp['dispatched_by']}  lease recorded")
     print(f"   NOTE: enforce the host-RAM watchdog on BOTH allocation AND teardown; use os._exit().")
