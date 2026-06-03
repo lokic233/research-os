@@ -359,9 +359,22 @@ def retire(H, root, *, frm, to, project="", researcher_state="", seeder_state=""
             a["parent"] = to; a["last_parent_change"] = now
             H["dump_yaml"](fn, a)
             moved_agents.append(a.get("agent_id"))
-    # 4. flip frm -> retired
-    frec["status"] = "retired"; frec["retired_at"] = now; frec["retired_to"] = to
-    H["dump_yaml"](fp, frec)
+    # 4. flip frm -> retired. BUG-101: steps 1-3 above (task/agent scans, multiple dumps) take real
+    #    wall-time; frec was loaded at the TOP of retire(), BEFORE that body. A concurrent heartbeat from
+    #    frm — which serializes under _file_lock(agent_frm) and re-reads on disk per BUG-99 — lands inside
+    #    that window and bumps frm.yaml; retire's UNLOCKED dump of the STALE frec then erases that update
+    #    (lost heartbeat_count/last_heartbeat/session/exp; defeats the very lock heartbeat respects).
+    #    Mirror BUG-99: take the same per-agent lock and RE-READ on disk, then force the terminal flip
+    #    onto the fresh record so the concurrent heartbeat's liveness fields are preserved.
+    _fl = H.get("_file_lock")
+    if _fl is not None:
+        with _fl(root, f"agent_{frm}", stale_s=15):
+            fresh = H["load_yaml"](fp, {}) or frec
+            fresh["status"] = "retired"; fresh["retired_at"] = now; fresh["retired_to"] = to
+            H["dump_yaml"](fp, fresh)
+    else:
+        frec["status"] = "retired"; frec["retired_at"] = now; frec["retired_to"] = to
+        H["dump_yaml"](fp, frec)
     # 5. structured handoff artifact
     ho = handoff(H, root, frm=frm, to=to, project=project or frec.get("project_id", ""),
             researcher_state=researcher_state, seeder_state=seeder_state, open_work=open_work,

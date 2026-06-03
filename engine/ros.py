@@ -2045,7 +2045,8 @@ def cmd_commit(args):
 def _sup_helpers():
     """Bundle ros.py helpers for engine/supervise.py (avoids circular import)."""
     return {"load_yaml": load_yaml, "dump_yaml": dump_yaml, "NOW": NOW, "next_id": next_id,
-            "reg_dir": reg_dir, "runtime_dir": runtime_dir, "_cfg": _cfg, "Channel": Channel}
+            "reg_dir": reg_dir, "runtime_dir": runtime_dir, "_cfg": _cfg, "Channel": Channel,
+            "_file_lock": _file_lock}
 
 def _sup():
     import importlib, supervise
