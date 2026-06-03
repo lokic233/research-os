@@ -149,7 +149,7 @@ def next_id(root, kind, prefix):
 import contextlib as _contextlib
 @_contextlib.contextmanager
 def _file_lock(root, name, stale_s=30, tries=600):
-    """BUG-84: minimal exclusive lock (same O_EXCL + stale-reclaim discipline as next_id / BUG-52).
+    """BUG-85: minimal exclusive lock (same O_EXCL + stale-reclaim discipline as next_id / BUG-52).
     Serializes a read-modify-write critical section on a shared runtime file (e.g. the gpu queue),
     so concurrent callers cannot both pass a check-then-act and clobber each other."""
     import time as _t
@@ -1281,17 +1281,29 @@ def cmd_gpu_poll(args):
                 print(f"   (heartbeat for {args.node} was stale; live probe OK, refreshed heartbeat)")
             except Exception as _e:
                 print(f"   (warn: live probe OK but could not refresh heartbeat: {str(_e)[:120]})")
-    # pick next queued exp matching this node's gpu_type (or 'any'), highest priority, watchdog-safe on fragile
+    # BUG-85: pick + claim under an exclusive queue lock. The probe (slow, ~30s) ran OUTSIDE the lock above;
+    # here we RE-READ the queue under the lock and re-check this node's lease, so two nodes polling concurrently
+    # can't both pass check-then-act and pull the SAME exp (double GPU dispatch + clobbered lease — esp. unsafe
+    # on fragile MI350X). Same O_EXCL + stale-reclaim discipline as next_id (BUG-52) / Channel (BUG-59).
     cand=None
-    for i in sorted(q["queue"],key=lambda x:-x.get("priority",0)):
-        gt=i.get("gpu_type","any")
-        if gt not in ("any", node.get("gpu_type")): continue
-        if node.get("fragile") and (i.get("host_mem_floor_gb",0) or 0)<=0: continue  # SAFETY: never on fragile w/o floor
-        cand=i; break
-    if not cand: print(f"{args.node} FREE but no matching queued exp."); return
-    # claim the lease + mark dispatched
-    q["queue"]=[i for i in q["queue"] if i["exp_id"]!=cand["exp_id"]]
-    q["leases"][args.node]=cand["exp_id"]; dump_yaml(_gpu_queue_path(root),q)
+    with _file_lock(root, "gpu_queue", stale_s=30):
+        q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
+        q.setdefault("leases",{})
+        if q["leases"].get(args.node):
+            print(f"{args.node} BUSY (lease {q['leases'][args.node]}); no pull."); return
+        # pick next queued exp matching this node's gpu_type (or 'any'), highest priority, watchdog-safe on fragile
+        for i in sorted(q["queue"],key=lambda x:-x.get("priority",0)):
+            gt=i.get("gpu_type","any")
+            if gt not in ("any", node.get("gpu_type")): continue
+            if node.get("fragile") and (i.get("host_mem_floor_gb",0) or 0)<=0: continue  # SAFETY: never on fragile w/o floor
+            # already leased to ANOTHER node? skip (another poller claimed it) — no double dispatch
+            if i.get("exp_id") in q["leases"].values(): continue
+            cand=i; break
+        if not cand: print(f"{args.node} FREE but no matching queued exp."); return
+        # claim the lease + remove from queue, atomically, before releasing the lock
+        q["queue"]=[i for i in q["queue"] if i["exp_id"]!=cand["exp_id"]]
+        q["leases"][args.node]=cand["exp_id"]; dump_yaml(_gpu_queue_path(root),q)
+    # mark the experiment dispatched (outside the queue lock; exp.yaml is owned by this single claimant now)
     ef=glob.glob(os.path.join(root,"experiments","**",cand["exp_id"],"experiment.yaml"),recursive=True)[0]
     e=load_yaml(ef); e["status"]="running"; e["started_at"]=NOW(); e["dispatched_by"]="gpu-scheduler"
     e["node_lease"]=f"{args.node}:{cand['exp_id']}"; e["hardware"]=node.get("gpu_type",""); dump_yaml(ef,e)
