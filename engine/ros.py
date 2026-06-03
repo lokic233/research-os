@@ -1280,11 +1280,19 @@ def cmd_gpu_queue(args):
     if _win and not exp.get("committee_approved"): print(f"   ⏱️ GPU auto-approve window OPEN (until {_until}) — committee gate waived for {args.exp}.")
     try: floor=int((exp.get("resource_budget") or {}).get("host_mem_floor_gb",0) or 0)  # BUG-94: coerce on-disk str floor -> int (fail safe to 0)
     except (TypeError, ValueError): floor=0
-    q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
-    if any(i.get("exp_id")==args.exp for i in q["queue"]): print(f"already queued: {args.exp}"); return
-    q["queue"].append({"exp_id":args.exp,"claim_id":exp.get("claim_id"),"gpu_type":args.gpu_type or "any",
-                       "host_mem_floor_gb":floor,"queued_at":NOW(),"priority":args.priority or 0})
-    dump_yaml(_gpu_queue_path(root),q)
+    # ★ BUG-100: the poller (cmd_gpu_poll, BUG-85) mutates the gpu_queue (lease+remove) under
+    # _file_lock(root,"gpu_queue"), but this ENQUEUE did an UNLOCKED load->append->dump on the SAME
+    # file. A `gpu queue` submit concurrent with a poller pull clobbers the poller's just-written
+    # lease (stale no-lease snapshot dumped last) -> lease WIPED + the leased exp REAPPEARS in the
+    # queue -> a second poller re-pulls it -> DOUBLE GPU DISPATCH (the exact BUG-85 hazard, reopened
+    # via enqueue-vs-poller instead of poller-vs-poller). Reproduced 8/8 lost-lease in isolated /tmp.
+    # Fix: serialize the enqueue RMW under the same queue lock + RE-READ inside it.
+    with _file_lock(root, "gpu_queue", stale_s=30):
+        q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
+        if any(i.get("exp_id")==args.exp for i in q["queue"]): print(f"already queued: {args.exp}"); return
+        q["queue"].append({"exp_id":args.exp,"claim_id":exp.get("claim_id"),"gpu_type":args.gpu_type or "any",
+                           "host_mem_floor_gb":floor,"queued_at":NOW(),"priority":args.priority or 0})
+        dump_yaml(_gpu_queue_path(root),q)
     print(f"✅ queued {args.exp} (gpu={args.gpu_type or 'any'}, floor={floor}GB). Scheduler pulls it when a node frees.")
 
 def cmd_gpu_status(args):
@@ -1396,8 +1404,13 @@ def cmd_gpu_poll(args):
     print(f"   run it with host-RAM watchdog on alloc AND teardown (os._exit). On completion: `ros gpu release --node {args.node}` then ros exp complete.")
 
 def cmd_gpu_release(args):
-    root=inst_root(args); q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
-    rel=q.get("leases",{}).pop(args.node,None); dump_yaml(_gpu_queue_path(root),q)
+    root=inst_root(args)
+    # ★ BUG-100: release also mutates the shared gpu_queue (pop a lease). An unlocked load->pop->dump
+    # racing the poller's locked lease+remove write would clobber it (same class as the enqueue path).
+    # Serialize under the same queue lock + re-read inside it.
+    with _file_lock(root, "gpu_queue", stale_s=30):
+        q=load_yaml(_gpu_queue_path(root),{"queue":[],"leases":{}}) or {"queue":[],"leases":{}}
+        rel=q.get("leases",{}).pop(args.node,None); dump_yaml(_gpu_queue_path(root),q)
     print(f"released {args.node}" + (f" (was {rel})" if rel else " (no lease)"))
 
 
