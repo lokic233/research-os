@@ -75,5 +75,25 @@ for mk in "$NDIR"/*.reseed "$NDIR"/*.advance "$NDIR"/*.seed; do
 done
 # lanes exit 3 = actionable (handled above), exit 0 = all HOLD/AWAIT (silent healthy). Both are success.
 [ "$lanes_rc" -ne 0 ] && [ "$lanes_rc" -ne 3 ] && rc=1
+
+# ★ BUG-115 (dengcchi directive): RESEARCHER-STALL -> notify the orchestrator to TROUBLESHOOT (distinct
+# from RESEED). `ros progress` (monitor #4) flags work-not-landing per claim (local-but-uncommitted /
+# committee-done-no-verdict / gpu-run-no-result / committee-queued-not-convened). On a v3 instance the
+# orchestrator is the commit mediator + committee convener; if those stalls persist it usually means a
+# researcher/lane is wedged. Forward the stall set to the orchestrator (notify-once per stall-set; clears
+# when progress is clean) so an unhealthy researcher gets troubleshot, not silently parked.
+prog_out="$(ROS progress 2>&1)"; prog_rc=$?
+if [ "$prog_rc" -eq 3 ]; then
+  stallset="$(echo "$prog_out" | grep '🔴' | grep -oE 'CLAIM-[0-9]+ \([^)]*\) [a-z-]+' | sort | tr '\n' ';')"
+  if [ ! -f "$NDIR/researcher_stall" ] || [ "$(cat "$NDIR/researcher_stall" 2>/dev/null)" != "$stallset" ]; then
+    ROS notify --to orchestrator --event RESEARCHER_STALL --subject "work-not-landing" \
+      --detail "$(echo "$prog_out" | grep '🔴' | head -8 | tr '\n' ';') — troubleshoot the wedged researcher/lane (re-commit / convene committee / fault+re-dispatch / reseed)" \
+      --by proj-monitor --role proj_monitor >/dev/null && printf '%s' "$stallset" > "$NDIR/researcher_stall"
+    log "RESEARCHER_STALL -> orchestrator ($(echo "$stallset" | tr ';' '\n' | grep -c CLAIM) claim(s))"
+  fi
+else
+  rm -f "$NDIR/researcher_stall"   # progress clean -> clear so a future stall re-notifies
+fi
+
 [ "$rc" -eq 0 ] && stamp_alive proj_monitor
 exit "$rc"

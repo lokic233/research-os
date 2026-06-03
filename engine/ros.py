@@ -2879,6 +2879,64 @@ def cmd_notify(args):
     print(f"📨 notified {target} [{flag}] {args.event or 'NOTE'}: {args.subject or ''}")
 
 
+def cmd_seeder_next(args):
+    """★ BUG-115 (dengcchi directive): the persistent-seeder loop signal. A claim-seeder/researcher that has
+    just COMMITTED/written its claim runs this (read-only) to decide its NEXT move under its project, INSTEAD
+    of going terminal/idle. Scans the project's claims vs verdicts + live researchers and returns ONE of:
+      SEED-NEXT  — frontier open (a claim slot is free: every existing claim is terminal/adjudicated AND the
+                   project is below researchers_per_project for live seeders) -> DESIGN a NEW claim here.
+      AWAIT      — a claim of this project still has an experiment running / committee pending / verdict
+                   pending -> let it land; don't seed on top of in-flight work.
+      CONVERGE   — every claim is terminal AND the topic is exhausted (operator/orchestrator may mark
+                   projects/<P>/.converged) -> free the slot for a fresh project.
+    Exit 3 if SEED-NEXT (actionable), else 0. The point: a researcher NEVER sits idle after one claim — it
+    either designs the next claim, waits on in-flight work, or converges the project. No make-work: SEED-NEXT
+    only fires when there's a genuinely free claim slot and no in-flight claim to wait on."""
+    root = inst_root(args); rd = runtime_dir(root); cfg = _cfg(root)
+    pid = args.project
+    if not pid: sys.exit("❌ --project required.")
+    TERMINAL_LS = ("done",)
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    grace = int((cfg.get("liveness", {}) or {}).get("patient_grace_minutes", 45))
+    per_proj = int((cfg.get("research", {}) or {}).get("researchers_per_project", 1))
+    # claims of this project
+    cs = []
+    for fn in glob.glob(reg_dir(root,"claims","**","CLAIM-*.yaml"),recursive=True):
+        c = load_yaml(fn, {}) or {}
+        if c.get("project_id") == pid: cs.append(c)
+    # in-flight = a claim with an exp running / committee pending / evidence_ready / verdict_recorded-yellow
+    inflight = [c for c in cs if c.get("lifecycle_state") in
+                ("experiment_running","experiment_designing","committee_pending","evidence_ready","prior_art_pending","blocked")]
+    # live researchers on this project (excluding the caller if it's already terminal)
+    live = []
+    for fn in glob.glob(os.path.join(rd,"agents","*.yaml")):
+        a = load_yaml(fn, {}) or {}
+        if a.get("role")!="researcher" and "researcher" not in (a.get("agent_id") or ""): continue
+        if (a.get("project_id") or _infer_proj_from_id(a.get("agent_id",""))) != pid: continue
+        if a.get("status") in ("completed","retired","failed","dead","superseded","done","dropped"): continue
+        try:
+            age=(now-_dt.datetime.strptime(a.get("last_heartbeat",""),"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)).total_seconds()/60
+        except Exception: age=1e9
+        if age<=grace: live.append(a.get("agent_id"))
+    converged = _is_converged_project(os.path.join(root,"projects",pid))
+    nclaims=len(cs); nverd=sum(1 for c in cs if c.get("lifecycle_state") in TERMINAL_LS or c.get("verdict_history"))
+    print(f"SEEDER-NEXT {pid}: {nclaims} claim(s), {len(inflight)} in-flight, {len(live)} live researcher(s), "
+          f"per_project={per_proj}, converged={converged}")
+    if converged:
+        print("  ✅ CONVERGE — project already marked converged; no new claim. Free the slot."); return
+    if inflight:
+        print(f"  ⏳ AWAIT — in-flight claim(s): {', '.join(c.get('claim_id','?') for c in inflight)} "
+              f"— let them land (committee/exp/verdict) before seeding a new claim."); return
+    # no in-flight work. is there a free seeder slot?
+    if len(live) >= per_proj:
+        print(f"  ⏳ AWAIT — {len(live)} live researcher(s) already at per_project={per_proj}; no free slot."); return
+    print(f"  🌱 SEED-NEXT — frontier open ({nclaims} claim(s) all adjudicated, slot free): DESIGN a NEW "
+          f"cemetery-checked claim under {pid} (or `touch projects/{pid}/.converged` if the topic is mined out). "
+          f"Do NOT sit idle.")
+    sys.exit(3)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ros", description="research-os engine CLI")
     ap.add_argument("--instance", help="instance repo root (default: cwd)")
@@ -2977,6 +3035,9 @@ def main():
     sub.add_parser("liveness").set_defaults(fn=cmd_liveness)
     sub.add_parser("submonitors").set_defaults(fn=cmd_submonitors)
     sub.add_parser("lanes", help="ANTI-SPRAWL single-poller per-lane work plan (FORWARD|AWAIT|RESEED?|HOLD); read-only").set_defaults(fn=cmd_lanes)
+    sn_ = sub.add_parser("seeder-next", help="BUG-115: persistent-seeder signal — after committing a claim, a researcher runs this to decide SEED-NEXT|AWAIT|CONVERGE under its project instead of going idle; read-only")
+    sn_.add_argument("--project", required=True); sn_.add_argument("--by", help="calling researcher id")
+    sn_.set_defaults(fn=cmd_seeder_next)
     sub.add_parser("coordinators").set_defaults(fn=cmd_coordinators)
     cm = sub.add_parser("commit")
     cm.add_argument("--message", "-m", help="commit message (default: ros commit autosave <ts>)")
