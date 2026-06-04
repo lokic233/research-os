@@ -1939,6 +1939,55 @@ def cmd_verdict_write(args):
             if non_green:
                 sys.exit(f"❌ green_rule=unanimous: every member must vote green for a {args.final} verdict; "
                          f"non-green: {non_green}.")
+        # ★ BUG-119 FIX (forge-proof integrity reconciliation): the slate checks above validate the
+        # --votes STRING (role coverage / dedup / unanimity), but NOTHING reconciled that slate against
+        # the ACTUAL committee evidence in committee_run_dir. A caller (buggy/hallucinating/compromised
+        # orchestrator) could therefore mint an auditable 6/6 GREEN, override_rule:false, while the cited
+        # committee's .out files all said RED and _status was INCOMPLETE (reproduced in /tmp). The
+        # BUG-81/95 comments referenced a "votes-vs-.out auditor" that never existed. A green/promote now
+        # REQUIRES the cited committee dir to back the slate: (1) a committee dir resolves, (2) its
+        # _status is ALL_COMMITTEE_DONE (an INCOMPLETE/in-flight run can NEVER back a green), (3) every
+        # member role has a non-empty <role>.out, (4) the vote parsed from each .out MATCHES the slate
+        # vote for that role. Reviewers write "ROLE: r  VOTE: v"; the chair writes "FINAL_VERDICT: v".
+        # We take the LAST such marker per file (rationale prose may mention other votes). --override-rule
+        # remains the only audited bypass (skips this whole block, stamps override_rule:true).
+        import re as _re119
+        _cdir_rel = (getattr(args, "committee_dir", "") or _infer_committee_dir(root, exp_paths))
+        if not _cdir_rel:
+            sys.exit(f"❌ BUG-119 integrity: a {args.final} verdict must cite its committee_run_dir "
+                     f"(none given and none inferable from {exp_ids}). Use --override-rule only with "
+                     f"explicit justification.")
+        _cdir_abs = os.path.join(root, _cdir_rel)
+        _status_f = os.path.join(_cdir_abs, "_status.txt")
+        _status_txt = ""
+        try: _status_txt = open(_status_f, encoding="utf-8", errors="replace").read().strip()
+        except Exception: _status_txt = ""
+        if not _status_txt.startswith("ALL_COMMITTEE_DONE"):
+            sys.exit(f"❌ BUG-119 integrity: committee {_cdir_rel} is not ALL_COMMITTEE_DONE "
+                     f"(_status='{_status_txt[:60]}') — an incomplete/in-flight committee can NEVER back a "
+                     f"{args.final}. (use --override-rule only with explicit justification.)")
+        def _vote_from_out(_p):
+            try: _t = open(_p, encoding="utf-8", errors="replace").read()
+            except Exception: return None
+            # reviewers write "ROLE: r  VOTE: v" (VOTE not line-anchored); chair writes "FINAL_VERDICT: v".
+            # take the LAST marker (rationale prose may mention other vote words). Accept green/yellow/red.
+            _hits = _re119.findall(r'(?i)\b(?:VOTE|FINAL_VERDICT)\s*:\s*(green|yellow|red)\b', _t)
+            return _hits[-1].strip().lower() if _hits else None
+        _mismatch = []
+        for _r in member_roles:
+            _of = os.path.join(_cdir_abs, f"{_r}.out")
+            if not (os.path.exists(_of) and os.path.getsize(_of) > 0):
+                _mismatch.append(f"{_r}: NO .out evidence in {_cdir_rel}")
+                continue
+            _ev = _vote_from_out(_of)
+            if _ev is None:
+                _mismatch.append(f"{_r}: .out has no parseable VOTE/FINAL_VERDICT")
+            elif _ev != vote_by_role.get(_r):
+                _mismatch.append(f"{_r}: slate={vote_by_role.get(_r)} but .out={_ev}")
+        if _mismatch:
+            sys.exit(f"❌ BUG-119 integrity: the --votes slate does NOT match the committee evidence at "
+                     f"{_cdir_rel} — a {args.final} must reflect the real committee, not an arbitrary "
+                     f"slate. Mismatches: {_mismatch}. (use --override-rule only with explicit justification.)")
     # BUG-18 fix: idempotency — if an identical verdict (same claim+experiments+final) already exists,
     # do NOT create a duplicate (guards against harness/transport retries of the same tool call).
     # ★ BUG-111: that dedup guard was a CHECK-THEN-ACT race — two retried identical verdict writes both
