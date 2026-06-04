@@ -149,7 +149,17 @@ def reap(H, root, *, apply=False, grace_min=45, converged_pids=None):
         if a.get("agent_id"):
             a["_fn"] = fn; a["_age"] = _age_min(a, now); agents.append(a)
     # freshest live agent per (project, role)
-    def key(a): return (a.get("project_id", ""), a.get("role", ""))
+    # BUG-120: gpu_coordinators are NOT generations of each other — gpu-coord-h100 (gpu:H100) and
+    # gpu-coord-mi350x (gpu:MI350X) both carry project_id='' + role='gpu_coordinator', so a plain
+    # (project,role) key collides them into ONE supersede bucket. A dead H100 coord then gets falsely
+    # 'superseded by' the live MI350X coord -> the H100 dispatcher is lost SILENTLY (no AGENT_DOWN) and
+    # its H100 task is reassigned to the MI350X coordinator (the exact GPU-type mismatch cmd_exp_dispatch
+    # guards against). Disambiguate coordinators by their gpu lane: a same-GPU generational successor
+    # still supersedes; a different-GPU sibling does NOT (it falls through to BUG-117 DEAD+NOTIFY).
+    def key(a):
+        if (a.get("role") or "").strip() == "gpu_coordinator":
+            return (a.get("project_id", ""), "gpu_coordinator", (a.get("gpu", "") or "").strip().lower())
+        return (a.get("project_id", ""), a.get("role", ""))
     # BUG-87 fix: agents with an empty/unknown role have NO role identity to inherit, so they must NOT
     # be grouped into a shared (project,"") bucket — otherwise any fresh unknown-role agent would silently
     # "supersede" an unrelated stale unknown-role agent, swallowing a real coverage gap WITHOUT the
