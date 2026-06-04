@@ -42,7 +42,13 @@ else
   _changed work_not_landing ""
 fi
 # #2/#3 (agent stall + wedged-log) are reaper/liveness duties already in the engine — surface coverage gaps:
-ROS reap >/dev/null 2>&1 || true
+# BUG-118: must pass --apply — bare `ros reap` is DRY-RUN (cmd_reap defaults apply=False), so past-grace
+# status=running zombies were never flipped -> the self-check kept self-identifying as a frozen orchestrator
+# and never spawned a successor (the ~10h silent brain death). --apply now flips lingerers (BUG-117-aware:
+# global singletons orchestrator/gpu_coordinator -> dead+AGENT_DOWN notify; per-project converged -> clean
+# retire; live successor present -> superseded). Idempotent + BUG-113 lock re-checks liveness INSIDE the
+# lock so a heartbeat that landed since the snapshot DEFERS the reap (never reaps a just-revived agent).
+ROS reap --apply >/dev/null 2>&1 || true
 # ★ BUG-83: NO cron flushed v3 state to GitHub — only the orchestrator's own `ros commit` did, so between
 # its cycles, committed-but-unpushed (and uncommitted durable) work accumulated = durability risk (box dies
 # -> work lost) AND the audit kept flagging push-drift. The monitor (5-min health watchdog) now flushes:
