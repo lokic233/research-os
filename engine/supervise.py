@@ -170,9 +170,21 @@ def reap(H, root, *, apply=False, grace_min=45, converged_pids=None):
             continue
         k = key(a); succ = live_fresh.get(k)
         pid = a.get("project_id", "")
+        # BUG-117: the orchestrator + gpu_coordinator are INSTANCE-GLOBAL singletons, not per-project
+        # workers. Their nominal project_id (the orchestrator carries PROJ-0001; coords carry none) is
+        # NOT a license to silent-retire them when that project converges — their absence is ALWAYS a
+        # coverage gap (the brain / the GPU dispatcher is gone). Before BUG-117, a past-grace orchestrator
+        # on a converged PROJ-0001 (or a coord with no project) fell into the converged/unscoped branch
+        # below -> 'retired (NO notify)' -> SILENT brain death + no respawn (the ~10h blackout). Role-aware:
+        # a past-grace global singleton with no live successor is DEAD+NOTIFY, regardless of project state.
+        _role = (a.get("role") or "").strip()
+        _is_global_singleton = _role in ("orchestrator", "gpu_coordinator")
         if succ and succ.get("agent_id") != a.get("agent_id"):
             new_status = "superseded"                   # a fresher r-version is live -> reap the old
             note = f"superseded by {succ.get('agent_id')} (age {round(a['_age'])}m)"
+        elif _is_global_singleton:
+            new_status = "dead"                         # instance-global singleton, no live successor -> ALWAYS a gap
+            note = f"DEAD (age {round(a['_age'])}m, no live successor for instance-global {_role}{' on converged ' + pid if pid in converged_pids else ''} — needs respawn/notify)"
         elif (not pid) or (pid in converged_pids):
             new_status = "retired"                      # converged/unscoped + no successor -> clean retire, NO notify
             note = f"retired (age {round(a['_age'])}m; {'converged ' + pid if pid else 'no project'}, no successor needed)"
